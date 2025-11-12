@@ -24,7 +24,7 @@ impl fmt::Display for LanguageString {
 			Language::French => "fr",
 			Language::ChineseSimplified => "chs",
 			Language::ChineseTraditional => "cht",
-			Language::Korean => "kr",
+			Language::Korean => "ko",
 			_ => &format!("unk{}", u8::from(self.0)),
 		};
 		formatter.write_str(string)
@@ -55,7 +55,7 @@ impl FromStr for LanguageString {
 			"fr" => Language::French,
 			"chs" => Language::ChineseSimplified,
 			"cht" => Language::ChineseTraditional,
-			"kr" => Language::Korean,
+			"ko" => Language::Korean,
 			other => other
 				.strip_prefix("unk")
 				.and_then(|id| id.parse::<u8>().ok())

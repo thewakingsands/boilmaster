@@ -96,7 +96,7 @@ fn languagestring_schema(_generator: &mut SchemaGenerator) -> Schema {
 	Schema::Object(SchemaObject {
 		metadata: Some(
 			Metadata {
-				description: Some("Known languages supported by the game data format. **NOTE:** Not all languages that are supported by the format are valid for all editions of the game. For example, the global game client acknowledges the existence of `chs` and `kr`, however does not provide any data for them.".into()),
+				description: Some("Known languages supported by the game data format. **NOTE:** Not all languages that are supported by the format are valid for all editions of the game. For example, the global game client acknowledges the existence of `chs` and `ko`, however does not provide any data for them.".into()),
 				..Default::default()
 			}
 			.into(),

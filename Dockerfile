@@ -54,7 +54,7 @@ ENV BM_VERSION_DIRECTORY="/app/persist/versions"
 ENV BM_SEARCH_SQLITE_DIRECTORY="/app/persist/search"
 
 # CAFE: define excluded languages
-ENV BM_READ_LANGUAGE_EXCLUDE="[ja,en,de,fr,cht,ko]"
+ENV BM_READ_LANGUAGE_EXCLUDE="[ja,en,de,fr,ko]"
 
 # CAFE: use game directory instead of version
 ENV BM_GAME_DIRECTORY="/app/game"

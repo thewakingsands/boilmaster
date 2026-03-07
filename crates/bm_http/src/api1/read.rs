@@ -89,7 +89,7 @@ fn languagestring_schema(_generator: &mut SchemaGenerator) -> Schema {
 		excel::Language::German,
 		excel::Language::French,
 		excel::Language::ChineseSimplified,
-		excel::Language::ChineseTraditional2,
+		excel::Language::ChineseTraditional,
 		excel::Language::Korean,
 	];
 

@@ -48,10 +48,10 @@ We use external data files instead of tracking all patches of the game. The foll
 Multi-language queries can be achieved with the `exd build` command of [ixion](https://github.com/thewakingsands/ixion), which generates a merged sqpack file from different servers.
 Set the environment variable `BM_READ_LANGUAGE_EXCLUDE` for different setups. For example:
 
-* Global: `[chs,cht,ko]`
-* SDO: `[ja,en,de,fr,cht,ko]`
-* Actoz: `[ja,en,de,fr,cht,chs]`
-* Combination of all available languages: `[cht]`
+* Global: `[chs,ko]`
+* SDO: `[ja,en,de,fr,ko]`
+* Actoz: `[ja,en,de,fr,chs]`
+* Combination of all available languages: `[]`
 
 Test language support with the following path:
 

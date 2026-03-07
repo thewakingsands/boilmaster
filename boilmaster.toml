@@ -38,7 +38,7 @@ entry.transient.exdschema = "*"
 [read.language]
 default = "chs"
 # This default configuration is set up for the global game client, which does not ship Chinese or Korean data.
-exclude = ["cht","tc"]
+exclude = []
 
 [game]
 directory = "game"

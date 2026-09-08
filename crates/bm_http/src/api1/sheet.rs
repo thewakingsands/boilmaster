@@ -8,7 +8,6 @@ use axum::{
 	Json, debug_handler,
 	extract::{FromRef, State},
 };
-use bm_version::VersionKey;
 use either::Either;
 use schemars::{
 	JsonSchema,
@@ -259,7 +258,7 @@ fn sheet_docs(operation: TransformOperation) -> TransformOperation {
 						source: "source".into(),
 						version: "version".into(),
 					},
-					version: VersionKey::from_str("f815390159effefd").expect("static"),
+					version: "20260908-6d044b4".into(),
 				},
 				rows: vec![RowResult::example(1), RowResult::example(2)],
 			})
@@ -365,7 +364,7 @@ fn row_docs(operation: TransformOperation) -> TransformOperation {
 						source: "source".into(),
 						version: "version".into(),
 					},
-					version: VersionKey::from_str("f815390159effefd").expect("static"),
+					version: "20260908-6d044b4".into(),
 				},
 				row: RowResult::example(1),
 			})

@@ -16,7 +16,7 @@ use tower_http::cors::CorsLayer;
 
 use crate::{http::HttpState, service::Service};
 
-use super::{read::RowReaderState, search, sheet};
+use super::{read::RowReaderState, search, sheet, version};
 
 const OPENAPI_JSON_ROUTE: &str = "/openapi.json";
 
@@ -41,6 +41,14 @@ pub fn router(config: Config, state: HttpState) -> Router {
 	};
 
 	ApiRouter::new()
+		.nest(
+			"/version",
+			version::router(state.clone()).with_path_items(|item| item.tag("versions")),
+		)
+		.nest(
+			"/versions",
+			version::router(state.clone()).with_path_items(|item| item.tag("versions")),
+		)
 		.nest(
 			"/search",
 			search::router(config.search, state.clone()).with_path_items(|item| item.tag("search")),

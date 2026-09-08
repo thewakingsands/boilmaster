@@ -192,7 +192,7 @@ pub struct Specifiers {
 
 	/// The canonical specifier for the version used in this response.
 	#[schemars(with = "String")]
-	pub version: bm_version::VersionKey,
+	pub version: String,
 }
 
 // todo maybe an extra bit of state requirements on this for the filters? that would allow the filters to be wired up per-handler i think. not sure how that aligns with existing state though
@@ -254,7 +254,7 @@ where
 			excel,
 			specifiers: Specifiers {
 				schema: schema_specifier,
-				version: version_key,
+				version: data.public_key(version_key)?,
 			},
 			schema,
 			language,

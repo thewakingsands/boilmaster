@@ -26,7 +26,7 @@ struct Config {
 	schema: bm_schema::Config,
 	search: bm_search::Config,
 
-	// New filesystem-based config
+	// Downloaded ixion release storage.
 	game: GameConfig,
 }
 
@@ -54,6 +54,7 @@ async fn main() -> anyhow::Result<()> {
 
 	let data = Arc::new(bm_data::Data::new(config.game.directory));
 	data.initialize()
+		.await
 		.context("failed to initialize data service")?;
 
 	let asset = Arc::new(bm_asset::Service::new(data.clone()));

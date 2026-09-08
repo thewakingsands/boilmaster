@@ -9,7 +9,6 @@ use axum::{
 	extract::{FromRef, State},
 };
 use bm_search::{SearchRequest as InnerSearchRequest, SearchRequestQuery};
-use bm_version::VersionKey;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -125,7 +124,7 @@ fn search_docs(operation: TransformOperation) -> TransformOperation {
 						source: "source".into(),
 						version: "version".into(),
 					},
-					version: VersionKey::from_str("f815390159effefd").expect("static"),
+					version: "20260908-6d044b4".into(),
 				},
 				results: vec![SearchResult {
 					score: 1.413,

@@ -1,7 +1,6 @@
 mod admin;
 mod auth;
 mod base;
-mod error;
 mod version;
 mod versions;
 

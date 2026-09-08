@@ -1,104 +1,33 @@
-use anyhow::Context;
-use axum::{
-	Router, debug_handler,
-	extract::{OriginalUri, State},
-	response::IntoResponse,
-	routing::get,
-};
-use bm_version::VersionKey;
-use maud::{Render, html};
-
+use super::base::BaseTemplate;
 use crate::{http::HttpState, service::Service};
-
-use super::{base::BaseTemplate, error::Result};
+use axum::{Router, extract::State, routing::get};
+use maud::{Markup, Render, html};
 
 pub fn router(state: HttpState) -> Router {
 	Router::new().route("/", get(versions).with_state(state))
 }
 
-struct VersionInfo {
-	key: VersionKey,
-	patch: String,
-	names: Vec<String>,
-	banned: bool,
-}
-
-#[debug_handler(state = HttpState)]
-async fn versions(
-	OriginalUri(uri): OriginalUri,
-	State(Service {
-		version: version_service,
-		..
-	}): State<Service>,
-) -> Result<impl IntoResponse> {
-	let version_info = |key: VersionKey| -> Result<_> {
-		let version = version_service.version(key).context("missing version")?;
-
-		let patch = version
-			.repositories
-			.first()
-			.map(|repository| repository.latest().name.clone())
-			.unwrap_or_else(|| "(NONE)".into());
-
-		Ok(VersionInfo {
-			key,
-			patch,
-			names: version_service.names(key).context("missing version")?,
-			banned: version.ban_time.is_some(),
-		})
-	};
-
-	let mut versions = version_service
-		.keys()
-		.into_iter()
-		.map(version_info)
-		.collect::<Result<Vec<_>>>()?;
-
-	versions.sort_unstable_by(|a, b| a.patch.cmp(&b.patch).reverse());
-
-	Ok((BaseTemplate {
-		title: "versions".to_string(),
+async fn versions(State(Service { data, .. }): State<Service>) -> Markup {
+	let versions = data.versions();
+	BaseTemplate {
+		title: "versions".into(),
 		content: html! {
+			p { "Only the latest local release is used for data requests. Up to 10 releases are retained." }
+			p { "Update state: " (data.update_status().state) }
 			table.striped {
-				thead {
-					tr {
-						th { "key" }
-						th { "names" }
-						th { "banned" }
-						th { "patch" }
-					}
-				}
-
+				thead { tr { th { "key" } th { "version" } th { "published" } th { "active" } } }
 				tbody {
-					@for version in versions {
+					@for (i, version) in versions.iter().enumerate() {
 						tr {
-							th {
-								code {
-									a href={ (uri) "/" (version.key) } {
-										(version.key)
-									}
-								}
-							}
-
-							td {
-								@for (index, name) in version.names.iter().enumerate() {
-									@if index > 0 { ", " }
-									(name)
-								}
-							}
-
-							td {
-								@if version.banned {
-									"❌"
-								}
-							}
-
-							td { (version.patch) }
+							td { a href={ "/admin/" (version.key) } { (version.key) } }
+							td { (version.version) }
+							td { (version.published_at) }
+							td { @if i == 0 { "latest" } }
 						}
 					}
 				}
 			}
 		},
-	})
-	.render())
+	}
+	.render()
 }

@@ -78,13 +78,14 @@ impl Search {
 
 	pub async fn start(&self, cancel: CancellationToken) -> Result<()> {
 		let mut receiver = self.data.subscribe();
-		self.ingest(cancel.child_token(), receiver.borrow().clone())
-			.await?;
+		let versions = receiver.borrow().clone();
+		self.ingest(cancel.child_token(), versions).await?;
 
 		loop {
 			select! {
 				Ok(_) = receiver.changed() => {
-					self.ingest(cancel.child_token(), receiver.borrow().clone()).await?
+					let versions = receiver.borrow().clone();
+					self.ingest(cancel.child_token(), versions).await?
 				}
 				_ = cancel.cancelled() => break,
 			}

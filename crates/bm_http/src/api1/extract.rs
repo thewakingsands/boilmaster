@@ -20,9 +20,10 @@ where
 {
 	type Rejection = Error;
 
-	async fn from_request_parts(_parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+	async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
 		let Service { data, .. } = Service::from_ref(state);
-		Ok(Self(data.version_key()))
+		let key = *parts.extensions.get_or_insert_with(|| data.version_key());
+		Ok(Self(key))
 	}
 }
 

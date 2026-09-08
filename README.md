@@ -4,19 +4,16 @@ Web service for Final Fantasy XIV game data and asset discovery, forked from [ac
 
 ## Notes for API Users
 
-We maintain an instance of Boilmaster at <https://xivapi-v2.xivcdn.com/> and provide Chinese-accelerated access.
+We maintain an instance at <https://xivapi-v2.xivcdn.com/> and provide Chinese-accelerated access.
 
-You can use it to serve Chinese users, but note the following differences:
-
-* We provide game data in the following languages: Chinese, Japanese, English, German, and French.
-* All version-related functionalities are disabled. The `version` parameter in the URL will not be handled.
-* No asset retrieval features are available. API endpoints starting with `/api/asset` will return 404 due to the high cost of hosting assets.
+* Game data supports Chinese, Japanese, English, German, and French.
+* Data requests always use the newest locally downloaded release. The `version` query parameter is ignored.
+* `GET /api/version` (also `/api/versions`) lists all retained local releases, newest first, and reports the current update job.
+* Asset retrieval endpoints remain disabled.
 
 ## Installation
 
-### Docker Usage
-
-Boilmaster is published as a Docker image on the GitHub Container Registry. An example `docker-compose.yml` file like the one below can be used to bring the service online.
+### Docker
 
 ```yml
 services:
@@ -24,37 +21,76 @@ services:
     image: ghcr.io/thewakingsands/boilmaster:latest
     container_name: boilmaster
     environment:
-      # Other configuration here, see the Configuration section below for more information.
+      BM_UPDATE_TOKEN: ${BM_UPDATE_TOKEN}
     volumes:
       - ${PWD}/persist:/app/persist
-      - /path/to/your/game:/app/game:ro
     ports:
       - 8080:8080
     restart: unless-stopped
 ```
 
-### Exd files
+### Game data and versions
 
-We use external data files instead of tracking all patches of the game. The following files should be present in the `game` directory
-(or mounted to `/app/game` when using Docker):
+At startup Boilmaster checks the [latest stable ixion release](https://github.com/thewakingsands/ixion/releases), downloads its `merged-{version}.zip`, validates the version file and SqPack data, then activates it. An existing local release remains available if the check or download fails. A first startup without cached data must successfully download a release before serving.
 
-* ffxivgame.ver
-* sqpack/ffxiv/0a0000.win32.dat
-* sqpack/ffxiv/0a0000.win32.index
-* sqpack/ffxiv/0a0000.win32.index2
+Set `BM_GAME_DIRECTORY` to a writable persistent directory (default `game`; Docker default `/app/persist/game`). No manually mounted game installation is required. Each downloaded release has its own directory and `release.json` metadata. The newest 10 releases are retained; temporary downloads are removed on completion or failure. Existing unmanaged files in this directory are not imported or deleted.
+
+Public version keys are the release titles, for example `20260908-6d044b4`. The separate `version` field comes from the asset filename, for example `2026.09.01.0000.0000`. Releases with the same game version but different release titles are distinct versions. Only the newest local release is announced to search ingestion. Search indexing runs asynchronously after activation, so new-version searches may be temporarily unavailable while indexing completes. Search cursors from an older release must be restarted after an update.
+
+The `/admin` routes are temporarily disabled. Use `GET /api/version` to inspect local releases and update status.
+
+### Triggering an update
+
+Set `BM_UPDATE_TOKEN` in the server environment. If it is absent or empty, update requests are rejected. Trigger an asynchronous update with either:
+
+```sh
+curl -X POST -H "Authorization: Bearer $BM_UPDATE_TOKEN" https://your-host/api/version
+# Compatible with the token-query flow in ixion/scripts/trigger-xivstrings-update.mjs:
+curl -X POST "https://your-host/api/version?token=$BM_UPDATE_TOKEN"
+```
+
+The response is `202 Accepted` with `update.state` set to `running`. Poll `GET /api/version` until the same `update.startedAt` job reaches `success` or `error`. Concurrent triggers return the currently running job. `update.updated` is `false` when the local release is already current; errors appear in `update.error`. `startedAt` and `finishedAt` are Unix nanosecond strings and can be compared directly as job identifiers. GET is public; only POST requires the update token. The application request span logs the URL path without the token query string.
+
+Example completed response:
+
+```json
+{
+  "key": "20260908-6d044b4",
+  "version": "2026.09.01.0000.0000",
+  "versions": [
+    {
+      "key": "20260908-6d044b4",
+      "version": "2026.09.01.0000.0000",
+      "published_at": "2026-09-08T12:54:01Z",
+      "names": ["latest"]
+    }
+  ],
+  "update": {
+    "state": "success",
+    "startedAt": "1788872100000000000",
+    "finishedAt": "1788872160000000000",
+    "updated": true,
+    "error": null
+  }
+}
+```
 
 ### Switching supported languages
 
-Multi-language queries can be achieved with the `exd build` command of [ixion](https://github.com/thewakingsands/ixion), which generates a merged sqpack file from different servers.
-Set the environment variable `BM_READ_LANGUAGE_EXCLUDE` for different setups. For example:
+The merged archive contains data from multiple servers. Set `BM_READ_LANGUAGE_EXCLUDE` to control the exposed languages, for example `[chs,ko]` for global languages, `[ja,en,de,fr,ko]` for Chinese only, or `[]` for all available languages.
 
-* Global: `[chs,ko]`
-* SDO: `[ja,en,de,fr,ko]`
-* Actoz: `[ja,en,de,fr,chs]`
-* Combination of all available languages: `[]`
-
-Test language support with the following path:
+Test language support with:
 
 ```
-/api/1/sheet/Item/1?fields=Name@lang(chs),Name@lang(de),Name@lang(en),Name@lang(fr),Name@lang(ja)
+/api/sheet/Item/1?fields=Name@lang(chs),Name@lang(de),Name@lang(en),Name@lang(fr),Name@lang(ja)
 ```
+
+### Release lifecycle tests
+
+```powershell
+$env:BM_TEST_ARCHIVE = 'C:\path\to\merged-2026.02.20.0000.0000.zip'
+cargo test -p bm_data --lib -- --include-ignored
+cargo test -p bm_http --lib
+```
+
+The fixture test uses a local HTTP server and temporary directories to exercise download, activation, duplicate triggers, failures, retention and offline restarts.

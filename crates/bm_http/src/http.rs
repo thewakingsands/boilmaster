@@ -74,7 +74,7 @@ pub async fn serve(
 						"request",
 						method = %request.method(),
 						route,
-						uri = %request.uri(),
+						path = %request.uri().path(),
 					)
 				})
 				// Downgrade access logs to TRACE.

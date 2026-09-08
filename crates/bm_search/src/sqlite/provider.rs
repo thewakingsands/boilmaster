@@ -115,6 +115,9 @@ impl Provider {
 					.cursors
 					.get(uuid)
 					.ok_or_else(|| Error::UnknownCursor(uuid))?;
+				if cursor.version != self.data.version_key() {
+					return Err(Error::UnknownCursor(uuid));
+				}
 
 				let database = self.database(cursor.version)?;
 				(cursor.version, database, cursor.inner)

@@ -50,6 +50,7 @@ impl Read {
 		self.default_language
 	}
 
+	#[allow(clippy::too_many_arguments)]
 	pub fn read(
 		&self,
 		excel: &excel::Excel,
@@ -63,7 +64,10 @@ impl Read {
 
 		filter: &Filter,
 		depth: u8,
-	) -> Result<Value> {
+	) -> Result<(Value, u32)> {
+		// TODO: This is incredibly kludgy, and should be replaced/refactored as part of a filter resolution step. As-is, we have to read too much before working out if it actually was too much. It shouldn't need reading at all.
+		let mut rows_read = 0;
+
 		let value = read_sheet(ReaderContext {
 			read: self,
 
@@ -81,10 +85,12 @@ impl Read {
 			columns: &[],
 			depth,
 
+			rows_read: &mut rows_read,
+
 			path: &[],
 		})?;
 
-		Ok(value)
+		Ok((value, rows_read))
 	}
 }
 
@@ -214,6 +220,9 @@ fn read_scalar_reference(
 					},
 				)])),
 				rows: &mut *context.rows,
+
+				rows_read: &mut *context.rows_read,
+
 				..context
 			})?;
 
@@ -259,6 +268,9 @@ fn read_scalar_reference(
 			other => other,
 		}?;
 
+		// TODO: HELL
+		*context.rows_read += 1;
+
 		let row_id = row_data.row_id();
 		let subrow_id = row_data.subrow_id();
 
@@ -269,6 +281,8 @@ fn read_scalar_reference(
 
 			rows: &mut HashMap::from([(context.language, row_data)]),
 			depth: context.depth.max(1) - 1,
+
+			rows_read: &mut *context.rows_read,
 
 			..context
 		})?;
@@ -326,7 +340,7 @@ fn read_scalar_i32(field: excel::Field) -> Result<i32> {
 fn read_node_array(
 	element_node: &schema::Node,
 	count: u32,
-	mut context: ReaderContext,
+	context: ReaderContext,
 ) -> Result<Value> {
 	let filter = match context.filter {
 		Filter::All => &Filter::All,
@@ -343,7 +357,7 @@ fn read_node_array(
 		.scan(0usize, |index, _| {
 			let Some(columns) = context.columns.get(*index..*index + size) else {
 				return Some(Err(Error::SchemaGameMismatch(
-					context.mismatch_error(format!("insufficient columns to satisfy array")),
+					context.mismatch_error("insufficient columns to satisfy array"),
 				)));
 			};
 			*index += size;
@@ -353,7 +367,9 @@ fn read_node_array(
 				ReaderContext {
 					filter,
 					columns,
-					rows: &mut context.rows,
+					rows: context.rows,
+
+					rows_read: &mut *context.rows_read,
 
 					..context
 				},
@@ -368,7 +384,7 @@ fn read_node_array(
 
 fn read_node_struct(
 	schema_fields: &[schema::StructField],
-	mut context: ReaderContext,
+	context: ReaderContext,
 ) -> Result<Value> {
 	let filter_fields = match context.filter {
 		Filter::All => None,
@@ -377,7 +393,7 @@ fn read_node_struct(
 			for (key, entry) in filter_fields.iter() {
 				filters_by_field
 					.entry(entry.field.clone())
-					.or_insert_with(|| Vec::new())
+					.or_insert_with(Vec::new)
 					.push((key, entry));
 			}
 			Some(filters_by_field)
@@ -421,7 +437,7 @@ fn read_node_struct(
 			.path
 			.iter()
 			.chain(&[field_name.as_ref()])
-			.map(|&field| field)
+			.copied()
 			.collect::<Vec<_>>();
 
 		for (key, entry) in language_filters {
@@ -432,8 +448,11 @@ fn read_node_struct(
 					language: entry.language,
 					read_as: entry.read_as,
 					columns,
-					rows: &mut context.rows,
+					rows: context.rows,
 					path: &path,
+
+					rows_read: &mut *context.rows_read,
+
 					..context
 				},
 			)?;
@@ -493,7 +512,7 @@ fn iterate_struct_fields<'s, 'c>(
 	};
 
 	let items = fields
-		.into_iter()
+		.iter()
 		.scan(0usize, move |last_offset, field| {
 			let field_offset =
 				usize::try_from(field.offset).expect("schema field offset too large");
@@ -552,12 +571,14 @@ struct ReaderContext<'a> {
 	rows: &'a mut HashMap<excel::Language, excel::Row>,
 	depth: u8,
 
+	rows_read: &'a mut u32,
+
 	path: &'a [&'a str],
 }
 
 impl ReaderContext<'_> {
 	fn next_field(&mut self) -> Result<excel::Field> {
-		let column = self.columns.get(0).ok_or_else(|| {
+		let column = self.columns.first().ok_or_else(|| {
 			Error::SchemaGameMismatch(
 				self.mismatch_error("tried to read field but no columns available".to_string()),
 			)
@@ -568,6 +589,9 @@ impl ReaderContext<'_> {
 		let row = match self.rows.entry(language) {
 			hash_map::Entry::Occupied(entry) => entry.into_mut(),
 			hash_map::Entry::Vacant(entry) => {
+				// TODO: HELL
+				*self.rows_read += 1;
+
 				entry.insert(self.excel.sheet(self.sheet)?.subrow_with_options(
 					self.row_id,
 					self.subrow_id,

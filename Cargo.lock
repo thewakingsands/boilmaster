@@ -356,11 +356,13 @@ dependencies = [
  "bytes",
  "image",
  "mini-moka",
+ "object_store",
  "serde",
  "serde_json",
  "strum",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 

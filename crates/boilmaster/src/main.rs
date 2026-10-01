@@ -78,6 +78,9 @@ async fn main() -> anyhow::Result<()> {
 	let shutdown_token = shutdown_token();
 
 	tokio::try_join!(
+		asset
+			.start(shutdown_token.child_token())
+			.map(|result| result.context("asset service")),
 		schema
 			.start(shutdown_token.clone())
 			.map(|result| result.context("schema service")),
@@ -87,7 +90,7 @@ async fn main() -> anyhow::Result<()> {
 		bm_http::serve(
 			shutdown_token,
 			config.http,
-			asset,
+			asset.clone(),
 			data.clone(),
 			read,
 			schema.clone(),

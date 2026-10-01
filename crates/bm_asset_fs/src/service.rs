@@ -5,6 +5,8 @@ use bytes::Bytes;
 use mini_moka::sync::Cache;
 use serde::Deserialize;
 use tokio::sync::Semaphore;
+use tokio::time::{self, Duration, MissedTickBehavior};
+use tokio_util::sync::CancellationToken;
 
 use crate::{Error, Format, error::Result, texture};
 
@@ -16,6 +18,90 @@ pub struct Config {
 	pub storage: bm_asset_index::Config,
 }
 
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use object_store::{ObjectStore, memory::InMemory, path::Path};
+
+	#[tokio::test(start_paused = true)]
+	async fn refreshes_hourly_recovers_after_failure_and_stops_on_shutdown() {
+		let store = Arc::new(InMemory::new());
+		let hex = format!(
+			"4958415301004000000000002c00010001000000400000006c000000f9b87a16{}0ae203872dc9c845{}01000000",
+			"00".repeat(32),
+			"01".repeat(32)
+		);
+		let index: Bytes = (0..hex.len())
+			.step_by(2)
+			.map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+			.collect::<Vec<_>>()
+			.into();
+		for version in ["1", "2"] {
+			store
+				.put(
+					&Path::from(format!("patches/{version}/assets.bin")),
+					index.clone().into(),
+				)
+				.await
+				.unwrap();
+		}
+		store
+			.put(
+				&Path::from("current.json"),
+				Bytes::from_static(br#"{"ffxiv":"1"}"#).into(),
+			)
+			.await
+			.unwrap();
+		let reader = Arc::new(
+			Reader::with_store(store.clone(), "", None, None)
+				.await
+				.unwrap(),
+		);
+		let service = Service::from_reader(Some(reader.clone()));
+		let cancel = CancellationToken::new();
+		let shutdown = cancel.clone();
+		let task = tokio::spawn(async move { service.start(shutdown).await });
+		tokio::task::yield_now().await;
+		store
+			.put(
+				&Path::from("current.json"),
+				Bytes::from_static(br#"{"ffxiv":"2"}"#).into(),
+			)
+			.await
+			.unwrap();
+		time::advance(Duration::from_secs(3599)).await;
+		tokio::task::yield_now().await;
+		assert_eq!(reader.snapshot(None).await.unwrap().version, "1");
+		time::advance(Duration::from_secs(1)).await;
+		tokio::task::yield_now().await;
+		assert_eq!(reader.snapshot(None).await.unwrap().version, "2");
+
+		store
+			.put(
+				&Path::from("current.json"),
+				Bytes::from_static(b"broken").into(),
+			)
+			.await
+			.unwrap();
+		time::advance(Duration::from_secs(3600)).await;
+		tokio::task::yield_now().await;
+		assert_eq!(reader.snapshot(None).await.unwrap().version, "2");
+		assert!(!task.is_finished());
+		store
+			.put(
+				&Path::from("current.json"),
+				Bytes::from_static(br#"{"ffxiv":"1"}"#).into(),
+			)
+			.await
+			.unwrap();
+		time::advance(Duration::from_secs(3600)).await;
+		tokio::task::yield_now().await;
+		assert_eq!(reader.snapshot(None).await.unwrap().version, "1");
+		cancel.cancel();
+		task.await.unwrap().unwrap();
+	}
+}
+
 pub struct Service {
 	reader: Option<Arc<Reader>>,
 	workers: Arc<Semaphore>,
@@ -23,6 +109,28 @@ pub struct Service {
 }
 
 impl Service {
+	/// Run hourly refreshes alongside the HTTP service, not on the request path.
+	pub async fn start(&self, cancel: CancellationToken) -> Result<()> {
+		let Some(reader) = &self.reader else {
+			return Ok(());
+		};
+		tokio::select! {
+			_ = cancel.cancelled() => {},
+			_ = async {
+				let period = Duration::from_secs(3600);
+				let mut interval = time::interval_at(time::Instant::now() + period, period);
+				interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+				loop {
+					interval.tick().await;
+					if let Err(error) = reader.reload().await {
+						tracing::warn!(%error, "asset reload failed; retaining previous snapshot");
+					}
+				}
+			} => {},
+		}
+		Ok(())
+	}
+
 	pub async fn new(config: Config) -> Result<Self> {
 		let reader = if config.enabled {
 			Some(Arc::new(Reader::new(config.storage).await?))

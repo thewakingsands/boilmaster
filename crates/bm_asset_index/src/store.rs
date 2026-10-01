@@ -1,4 +1,7 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{
+	path::PathBuf,
+	sync::{Arc, RwLock},
+};
 
 use bytes::{Bytes, BytesMut};
 use futures::TryStreamExt;
@@ -65,7 +68,10 @@ pub struct Reader {
 	store: Arc<dyn ObjectStore>,
 	prefix: String,
 	cache: Option<PathBuf>,
-	current: String,
+	// Initialized before the reader is exposed. Requests clone a whole snapshot
+	// so a reload cannot mix a new version with an old index.
+	current: RwLock<Option<Snapshot>>,
+	pinned: bool,
 	indexes: Cache<String, Arc<Index>>,
 	index_load: Mutex<()>,
 	requests: Semaphore,
@@ -109,44 +115,84 @@ impl Reader {
 	) -> Result<Self> {
 		let prefix = prefix.trim_matches('/').to_owned();
 		Path::parse(&prefix).map_err(|_| Error::Invalid("invalid storage prefix".into()))?;
-		let mut reader = Self {
+		let reader = Self {
 			store,
 			prefix,
 			cache,
-			current: String::new(),
+			current: RwLock::new(None),
+			pinned: version.is_some(),
 			indexes: Cache::new(4),
 			index_load: Mutex::new(()),
 			requests: Semaphore::new(32),
 		};
-		reader.current = if let Some(version) = version {
+		let version = if let Some(version) = version {
 			version
 		} else {
-			#[derive(Deserialize)]
-			struct Current {
-				ffxiv: Option<String>,
-				#[serde(rename = "lastValidIndex")]
-				last_valid_index: Option<String>,
-			}
-			let bytes = reader.fetch("current.json", 64 * 1024).await?;
-			let current: Current = serde_json::from_slice(&bytes)
-				.map_err(|_| Error::Index("invalid current.json".into()))?;
-			current
-				.last_valid_index
-				.filter(|v| !v.is_empty())
-				.or(current.ffxiv)
-				.ok_or_else(|| Error::Index("missing current version".into()))?
+			reader.current_version().await?
 		};
-		validate_version(&reader.current)?;
-		reader.snapshot(None).await?;
+		let snapshot = reader.load_snapshot(&version).await?;
+		reader.indexes.insert(version, snapshot.index.clone());
+		*reader
+			.current
+			.write()
+			.expect("asset snapshot lock poisoned") = Some(snapshot);
 		Ok(reader)
 	}
 
-	/// The default snapshot is pinned at startup, matching the old Go service.
+	async fn current_version(&self) -> Result<String> {
+		#[derive(Deserialize)]
+		struct Current {
+			ffxiv: Option<String>,
+			#[serde(rename = "lastValidIndex")]
+			last_valid_index: Option<String>,
+		}
+		let bytes = self.fetch("current.json", 64 * 1024).await?;
+		let current: Current = serde_json::from_slice(&bytes)
+			.map_err(|_| Error::Index("invalid current.json".into()))?;
+		current
+			.last_valid_index
+			.filter(|v| !v.is_empty())
+			.or(current.ffxiv)
+			.ok_or_else(|| Error::Index("missing current version".into()))
+	}
+
+	/// Reload both current.json and its index, including same-version replacements.
+	/// A failed reload leaves the last valid snapshot and index cache untouched.
+	/// Explicitly configured versions never follow current.json.
+	pub async fn reload(&self) -> Result<bool> {
+		if self.pinned {
+			return Ok(false);
+		}
+		let _load = self.index_load.lock().await;
+		let version = self.current_version().await?;
+		let snapshot = self.load_snapshot(&version).await?;
+		let mut current = self.current.write().expect("asset snapshot lock poisoned");
+		let old = current.as_ref().expect("asset reader initialized");
+		if old.version == snapshot.version
+			&& old.index.fingerprint() == snapshot.index.fingerprint()
+		{
+			return Ok(false);
+		}
+		self.indexes.insert(version, snapshot.index.clone());
+		tracing::info!(version = %snapshot.version, "asset snapshot reloaded");
+		*current = Some(snapshot);
+		Ok(true)
+	}
+
+	/// Default requests use the most recently validated snapshot.
 	/// Explicit versions load their own index; a missing/corrupt index never
 	/// silently falls back to a different version or to JSON.
 	pub async fn snapshot(&self, requested: Option<&str>) -> Result<Snapshot> {
+		let current = self
+			.current
+			.read()
+			.expect("asset snapshot lock poisoned")
+			.as_ref()
+			.expect("asset reader initialized")
+			.clone();
 		let version = match requested {
-			None | Some("latest") => &self.current,
+			None | Some("latest") => return Ok(current),
+			Some(v) if v == current.version => return Ok(current),
 			Some(v) => v,
 		};
 		validate_version(version)?;
@@ -163,6 +209,13 @@ impl Reader {
 				index,
 			});
 		}
+		let snapshot = self.load_snapshot(version).await?;
+		self.indexes.insert(version.into(), snapshot.index.clone());
+		Ok(snapshot)
+	}
+
+	async fn load_snapshot(&self, version: &str) -> Result<Snapshot> {
+		validate_version(version)?;
 		let path = format!("patches/{version}/assets.bin");
 		let bytes = match self.fetch(&path, INDEX_LIMIT).await {
 			Err(Error::NotFound(_)) => {
@@ -171,7 +224,6 @@ impl Reader {
 			other => other?,
 		};
 		let index = Arc::new(Index::parse(bytes)?);
-		self.indexes.insert(version.into(), index.clone());
 		Ok(Snapshot {
 			version: version.into(),
 			index,
@@ -337,6 +389,135 @@ mod tests {
 			Err(Error::Invalid(_))
 		));
 		assert!(reader.snapshot(Some("../other")).await.is_err());
+	}
+
+	#[tokio::test]
+	async fn reloads_versions_and_same_version_indexes_without_invalidating_snapshots() {
+		let store = Arc::new(InMemory::new());
+		put(
+			&store,
+			"current.json",
+			Bytes::from_static(br#"{"ffxiv":"1"}"#),
+		)
+		.await;
+		put(&store, "patches/1/assets.bin", golden()).await;
+		let reader = Reader::with_store(store.clone(), "", None, None)
+			.await
+			.unwrap();
+		let old = reader.snapshot(None).await.unwrap();
+		assert!(!reader.reload().await.unwrap());
+
+		let mut replacement = golden().to_vec();
+		replacement[72..104].fill(2);
+		let checksum = crc32fast::hash(&replacement[64..]);
+		replacement[28..32].copy_from_slice(&checksum.to_le_bytes());
+		put(&store, "patches/1/assets.bin", replacement.into()).await;
+		assert!(reader.reload().await.unwrap());
+		let updated = reader.snapshot(None).await.unwrap();
+		assert_ne!(old.index.fingerprint(), updated.index.fingerprint());
+		for requested in [None, Some("latest"), Some("1")] {
+			assert_eq!(
+				reader
+					.snapshot(requested)
+					.await
+					.unwrap()
+					.index
+					.fingerprint(),
+				updated.index.fingerprint()
+			);
+		}
+		assert!(!reader.reload().await.unwrap());
+		let path = "ui/icon/000000/000000.tex";
+		for (snapshot, content) in [(&old, b"old".as_slice()), (&updated, b"new".as_slice())] {
+			let entry = snapshot.index.lookup(path).unwrap().unwrap();
+			put(
+				&store,
+				&entry.object_path(),
+				Bytes::copy_from_slice(content),
+			)
+			.await;
+			assert_eq!(reader.read(snapshot, path).await.unwrap().1, content);
+		}
+
+		put(&store, "patches/2/assets.bin", golden()).await;
+		put(
+			&store,
+			"current.json",
+			Bytes::from_static(br#"{"ffxiv":"ignored","lastValidIndex":"2"}"#),
+		)
+		.await;
+		assert!(reader.reload().await.unwrap());
+		assert_eq!(reader.snapshot(None).await.unwrap().version, "2");
+		assert_eq!(
+			reader
+				.snapshot(Some("1"))
+				.await
+				.unwrap()
+				.index
+				.fingerprint(),
+			updated.index.fingerprint()
+		);
+		assert_eq!(reader.read(&old, path).await.unwrap().1, b"old"[..]);
+	}
+
+	async fn put(store: &InMemory, path: &str, bytes: Bytes) {
+		store.put(&Path::from(path), bytes.into()).await.unwrap();
+	}
+
+	#[tokio::test]
+	async fn failed_reloads_retain_current_and_recover_on_retry() {
+		let store = Arc::new(InMemory::new());
+		put(
+			&store,
+			"current.json",
+			Bytes::from_static(br#"{"ffxiv":"1","lastValidIndex":""}"#),
+		)
+		.await;
+		put(&store, "patches/1/assets.bin", golden()).await;
+		let reader = Reader::with_store(store.clone(), "", None, None)
+			.await
+			.unwrap();
+		let old = reader.snapshot(None).await.unwrap();
+		store.delete(&Path::from("current.json")).await.unwrap();
+		assert!(reader.reload().await.is_err());
+		for current in ["broken", "{}", r#"{"ffxiv":"../bad"}"#, r#"{"ffxiv":"2"}"#] {
+			put(
+				&store,
+				"current.json",
+				Bytes::copy_from_slice(current.as_bytes()),
+			)
+			.await;
+			assert!(reader.reload().await.is_err());
+			let active = reader.snapshot(None).await.unwrap();
+			assert_eq!(active.version, "1");
+			assert!(Arc::ptr_eq(&active.index, &old.index));
+		}
+		put(
+			&store,
+			"patches/2/assets.bin",
+			Bytes::from_static(b"corrupt"),
+		)
+		.await;
+		assert!(reader.reload().await.is_err());
+		assert_eq!(reader.snapshot(None).await.unwrap().version, "1");
+		put(&store, "patches/2/assets.bin", golden()).await;
+		assert!(reader.reload().await.unwrap());
+		assert_eq!(reader.snapshot(None).await.unwrap().version, "2");
+	}
+
+	#[tokio::test]
+	async fn pinned_versions_never_reload_storage() {
+		let store = Arc::new(InMemory::new());
+		put(&store, "patches/1/assets.bin", golden()).await;
+		let reader = Reader::with_store(store.clone(), "", None, Some("1".into()))
+			.await
+			.unwrap();
+		store
+			.delete(&Path::from("patches/1/assets.bin"))
+			.await
+			.unwrap();
+		assert!(!reader.reload().await.unwrap());
+		assert_eq!(reader.snapshot(None).await.unwrap().version, "1");
 	}
 
 	#[tokio::test]

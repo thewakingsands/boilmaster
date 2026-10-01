@@ -105,6 +105,10 @@ Supported routes:
 
 The upstream routes return the requested `png`, `jpg` or `webp` encoding. Map composition uses the main and optional background textures, including upstream's precomposed-map detection. Legacy `/i/` returns the original stored WebP/AVIF bytes with their actual content type, despite its `.png` suffix, and preserves the old ID-based lookup regardless of the supplied six-digit directory. These routes support ETag, conditional GET and HEAD. Errors are not marked cacheable. ETags include a digest of the entire index so replacing a same-version index invalidates response validators after restart.
 
+The file endpoints also accept `format=avif` for **passthrough only**: if the indexed source is AVIF, the response is byte-identical to the stored object, with `Content-Type: image/avif` and an `.avif` filename. No decoding or re-encoding takes place. A non-AVIF source returns 400; it is not converted to AVIF. To retrieve an AVIF map source texture unchanged, use `/api/asset?path=ui/map/s1d1/00/s1d100_m.tex&format=avif`. The composed-map endpoint does not accept AVIF, since returning its uncomposed source would change the endpoint's meaning.
+
+When `format` is omitted, `/api/asset?path=...` and `/api/asset/<game-path>` return the **stored object unchanged**, with its actual `Content-Type` and filename extension (normally WebP or AVIF). No decoding or re-encoding takes place. `/api/asset/map/<territory>/<index>` still defaults to **JPEG** because it composes multiple source textures; request an individual map source through `/api/asset?path=...` for raw bytes. The legacy `/i/` route does not use `format` and always returns the stored image format, even if a `format` query parameter or `Accept` header requests something else. There is no automatic `Accept`-based format negotiation.
+
 Asset routes accept `version=latest` (default) or an ixion game version with its own published `assets.bin`. Unlike EXD routes, this parameter is not ignored. Asset versions use game-version directory names, not GitHub release titles or upstream's version hashes. Historical versions need their own binary index before they can be served.
 
 For offline testing, set `BM_ASSET_DIRECTORY` to the local `ixion/storage/ui/sdo` directory and `BM_ASSET_PREFIX` to an empty string; no MinIO credentials are required. The independent `bm_asset_index` crate owns IXAS v1 parsing, SqPack directory/filename CRC32 lookup and read-only object access. It does not depend on HTTP, EXD or image conversion. `bm_asset` handles output conversion/map composition with bounded CPU work and an in-memory encoded-response cache.
@@ -117,7 +121,7 @@ Migration is additive: uploading `assets.bin` does not change `icons.json`, `map
 cargo test -p bm_asset_index -p bm_asset -p bm_http
 ```
 
-For a read-only smoke check against real data, pipe a JSON `bm_asset_index::Config` to `cargo run -p bm_asset --example verify_assets -- <icon-game-path> <map-territory> <map-index>`. It loads the binary index and checks all three output formats, including map composition. It does not write output files, cache files or MinIO objects. Pass credentials through stdin rather than command-line arguments. For a local check:
+For a read-only smoke check against real data, pipe a JSON `bm_asset_index::Config` to `cargo run -p bm_asset --example verify_assets -- <icon-game-path> <map-territory> <map-index>`. It loads the binary index and checks all three encoded output formats, including map composition, plus byte-identical AVIF passthrough when the icon is stored as AVIF. It does not write output files, cache files or MinIO objects. Pass credentials through stdin rather than command-line arguments. For a local check:
 
 ```powershell
 '{"directory":"D:/Projects/ff14/ixion/storage/ui/sdo","prefix":""}' | cargo run -p bm_asset --example verify_assets -- ui/icon/111000/111008_hr1.tex s1d1 00

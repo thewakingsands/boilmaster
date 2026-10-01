@@ -10,6 +10,8 @@ pub enum Format {
 	Jpeg,
 	Png,
 	Webp,
+	/// Return stored AVIF bytes unchanged; AVIF encoding is not supported.
+	Avif,
 }
 
 impl Format {
@@ -22,6 +24,7 @@ impl Format {
 			Self::Jpeg => "jpg",
 			Self::Png => "png",
 			Self::Webp => "webp",
+			Self::Avif => "avif",
 		}
 	}
 
@@ -30,6 +33,7 @@ impl Format {
 			Self::Jpeg => image::ImageFormat::Jpeg,
 			Self::Png => image::ImageFormat::Png,
 			Self::Webp => image::ImageFormat::WebP,
+			Self::Avif => image::ImageFormat::Avif,
 		}
 	}
 }
@@ -52,6 +56,7 @@ impl FromStr for Format {
 			"jpg" => Self::Jpeg,
 			"png" => Self::Png,
 			"webp" => Self::Webp,
+			"avif" => Self::Avif,
 			other => return Err(Error::UnknownFormat(other.into())),
 		})
 	}

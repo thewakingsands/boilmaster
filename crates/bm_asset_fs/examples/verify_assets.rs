@@ -29,6 +29,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 	let territory = args.get(1).map(String::as_str).unwrap_or("s1d1");
 	let index = args.get(2).map(String::as_str).unwrap_or("00");
 	for format in Format::iter() {
+		if format == Format::Avif {
+			let (source, stored) = service.raw(&snapshot, icon).await?;
+			if source.format == bm_asset_index::Format::Avif {
+				let output = service.convert(&snapshot, icon, format).await?;
+				assert_eq!(output, stored);
+				println!(
+					"icon avif: byte-identical passthrough bytes={}",
+					output.len()
+				);
+			}
+			continue;
+		}
 		for map in [false, true] {
 			let start = Instant::now();
 			let bytes = if map {
@@ -40,6 +52,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 				Format::Jpeg => image::ImageFormat::Jpeg,
 				Format::Png => image::ImageFormat::Png,
 				Format::Webp => image::ImageFormat::WebP,
+				Format::Avif => image::ImageFormat::Avif,
 			};
 			assert_eq!(image::guess_format(&bytes)?, expected);
 			let decoded = image::load_from_memory(&bytes)?;

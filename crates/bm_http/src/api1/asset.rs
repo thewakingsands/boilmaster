@@ -130,12 +130,7 @@ async fn legacy_icon(
 		if hr { "_hr1" } else { "" }
 	);
 	let (source, bytes) = asset.raw(&snapshot, &game_path).await?;
-	let content_type = match source.format.extension() {
-		"webp" => "image/webp",
-		"avif" => "image/avif",
-		_ => "application/octet-stream",
-	};
-	Ok(([(header::CONTENT_TYPE, content_type)], bytes).into_response())
+	Ok((TypedHeader(ContentType::from(stored_mime(source))), bytes).into_response())
 }
 
 // Original asset endpoint based on a game path in the url path.
@@ -147,7 +142,7 @@ struct Asset1Path {
 
 #[derive(Deserialize)]
 struct Asset1Query {
-	format: SchemaFormat,
+	format: Option<SchemaFormat>,
 }
 
 #[debug_handler(state = AssetState)]
@@ -173,9 +168,10 @@ struct AssetQuery {
 	#[schemars(example = "example_path")]
 	path: String,
 
-	/// Format that the asset should be converted into.
+	/// Optional output format. Omit to return the stored object unchanged.
+	/// Explicit `avif` is available only when the source is already AVIF.
 	#[schemars(example = "example_format")]
-	format: SchemaFormat,
+	format: Option<SchemaFormat>,
 }
 
 fn example_path() -> &'static str {
@@ -188,10 +184,18 @@ struct SchemaFormat(Format);
 
 impl_jsonschema!(SchemaFormat, format_schema);
 fn format_schema(_generator: &mut SchemaGenerator) -> Schema {
+	formats_schema(Format::iter())
+}
+
+fn map_format_schema(_generator: &mut SchemaGenerator) -> Schema {
+	formats_schema(Format::iter().filter(|format| *format != Format::Avif))
+}
+
+fn formats_schema(formats: impl Iterator<Item = Format>) -> Schema {
 	Schema::Object(SchemaObject {
 		instance_type: Some(InstanceType::String.into()),
 		enum_values: Some(
-			Format::iter()
+			formats
 				.map(|format| serde_json::to_value(format).expect("should not fail"))
 				.collect(),
 		),
@@ -206,7 +210,7 @@ fn example_format() -> SchemaFormat {
 fn asset2_docs(operation: TransformOperation) -> TransformOperation {
 	operation
 		.summary("read an asset")
-		.description("Read an asset from the game at the specified path, converting it into a usable format. If no valid conversion between the game file type and specified format exists, an error will be returned.")
+		.description("Read an indexed asset at the specified game path. Omit format to return the stored object byte-for-byte with its original content type. Explicit jpg, png and webp select an output encoding; avif returns an existing AVIF object unchanged. Non-AVIF sources cannot be requested as avif (400).")
 		.response_with::<200, Vec<u8>, _>(|mut response| {
 			response.inner().content = Format::iter()
 				.map(|format| {
@@ -224,24 +228,34 @@ fn asset2_docs(operation: TransformOperation) -> TransformOperation {
 #[debug_handler(state = AssetState)]
 async fn asset2(
 	AssetVersion(snapshot): AssetVersion,
-	Query(AssetQuery {
-		path,
-		format: SchemaFormat(format),
-	}): Query<AssetQuery>,
+	Query(AssetQuery { path, format }): Query<AssetQuery>,
 	State(asset): State<service::Asset>,
 ) -> Result<impl IntoApiResponse> {
-	// Perform the conversion.
-	let bytes = asset.convert(&snapshot, &path, format).await?;
+	let (bytes, content_type, extension) = match format {
+		Some(SchemaFormat(format)) => (
+			asset.convert(&snapshot, &path, format).await?,
+			format_mime(format),
+			format.extension().to_owned(),
+		),
+		None => {
+			let (source, bytes) = asset.raw(&snapshot, &path).await?;
+			(
+				bytes,
+				stored_mime(source),
+				source.format.extension().to_owned(),
+			)
+		}
+	};
 
 	// Try to derive a filename to use for the Content-Disposition header.
-	let filepath = std::path::Path::new(&path).with_extension(format.extension());
+	let filepath = std::path::Path::new(&path).with_extension(extension);
 	let disposition = match filepath.file_name().and_then(OsStr::to_str) {
 		Some(name) => format!("inline; filename=\"{name}\""),
 		None => "inline".to_string(),
 	};
 
 	let response = (
-		TypedHeader(ContentType::from(format_mime(format))),
+		TypedHeader(ContentType::from(content_type)),
 		// TypedHeader only has a really naive inline value with no ability to customise :/
 		[(header::CONTENT_DISPOSITION, disposition)],
 		bytes,
@@ -255,6 +269,15 @@ fn format_mime(format: Format) -> mime::Mime {
 		Format::Jpeg => mime::IMAGE_JPEG,
 		Format::Png => mime::IMAGE_PNG,
 		Format::Webp => "image/webp".parse().expect("mime parse should not fail"),
+		Format::Avif => "image/avif".parse().expect("mime parse should not fail"),
+	}
+}
+
+fn stored_mime(source: bm_asset::AssetRef) -> mime::Mime {
+	match source.format.extension() {
+		"webp" => format_mime(Format::Webp),
+		"avif" => format_mime(Format::Avif),
+		_ => mime::APPLICATION_OCTET_STREAM,
 	}
 }
 
@@ -285,6 +308,7 @@ fn example_index() -> &'static str {
 #[derive(Deserialize, JsonSchema)]
 struct MapQuery {
 	#[serde(default = "default_map_format")]
+	#[schemars(schema_with = "map_format_schema")]
 	format: SchemaFormat,
 }
 
@@ -296,10 +320,11 @@ fn map_docs(operation: TransformOperation) -> TransformOperation {
 	operation
 		.summary("compose a map")
 		.description(
-			"Retrieve the specified map, composing it from split source files if necessary.",
+			"Retrieve the specified map, composing it from split source files if necessary. The format defaults to jpg; png and webp are also supported. AVIF passthrough is available only through /asset with a source texture path, not this composition endpoint.",
 		)
 		.response_with::<200, Vec<u8>, _>(|mut response| {
 			response.inner().content = Format::iter()
+				.filter(|format| *format != Format::Avif)
 				.map(|format| {
 					(
 						format_mime(format).to_string(),
@@ -520,6 +545,248 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn avif_passthrough_preserves_bytes_headers_and_cache_behavior() {
+		let app = fixture_with_format(true).await;
+		let expected = include_str!("../../../bm_asset_fs/tests/fixtures/rgba.avif.hex").trim();
+		for url in [
+			"/api/asset?path=ui/icon/000000/000001.tex&format=avif",
+			"/api/asset/ui/icon/000000/000001.tex?format=avif",
+			"/api/asset?path=ui/map/s1d1/00/s1d100_m.tex&format=avif",
+		] {
+			let response = app
+				.clone()
+				.oneshot(Request::builder().uri(url).body(Body::empty()).unwrap())
+				.await
+				.unwrap();
+			assert_eq!(response.status(), StatusCode::OK, "{url}");
+			assert_eq!(response.headers()[header::CONTENT_TYPE], "image/avif");
+			assert!(
+				response.headers()[header::CONTENT_DISPOSITION]
+					.to_str()
+					.unwrap()
+					.ends_with(".avif\"")
+			);
+			assert!(response.headers().contains_key(header::CACHE_CONTROL));
+			let etag = response.headers()[header::ETAG].clone();
+			let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+			assert_eq!(
+				body.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+				expected
+			);
+			let response = app
+				.clone()
+				.oneshot(
+					Request::builder()
+						.uri(url)
+						.header(header::IF_NONE_MATCH, etag)
+						.body(Body::empty())
+						.unwrap(),
+				)
+				.await
+				.unwrap();
+			assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+			assert!(
+				to_bytes(response.into_body(), 1024)
+					.await
+					.unwrap()
+					.is_empty()
+			);
+			let response = app
+				.clone()
+				.oneshot(
+					Request::builder()
+						.method("HEAD")
+						.uri(url)
+						.body(Body::empty())
+						.unwrap(),
+				)
+				.await
+				.unwrap();
+			assert_eq!(response.status(), StatusCode::OK);
+			assert_eq!(response.headers()[header::CONTENT_TYPE], "image/avif");
+			assert!(
+				to_bytes(response.into_body(), 1024)
+					.await
+					.unwrap()
+					.is_empty()
+			);
+		}
+	}
+
+	#[tokio::test]
+	async fn omitted_format_returns_stored_bytes_for_both_source_formats() {
+		for avif in [false, true] {
+			let app = fixture_with_format(avif).await;
+			let original = app
+				.clone()
+				.oneshot(
+					Request::builder()
+						.uri("/i/000000/000001.png")
+						.body(Body::empty())
+						.unwrap(),
+				)
+				.await
+				.unwrap();
+			let stored = to_bytes(original.into_body(), 1024 * 1024).await.unwrap();
+			for url in [
+				"/api/asset?path=ui/icon/000000/000001.tex",
+				"/api/asset/ui/icon/000000/000001.tex",
+				"/api/asset?path=ui/map/s1d1/00/s1d100_m.tex",
+			] {
+				let response = app
+					.clone()
+					.oneshot(
+						Request::builder()
+							.uri(url)
+							.header(header::ACCEPT, "image/png")
+							.body(Body::empty())
+							.unwrap(),
+					)
+					.await
+					.unwrap();
+				assert_eq!(response.status(), StatusCode::OK);
+				assert_eq!(
+					response.headers()[header::CONTENT_TYPE],
+					if avif { "image/avif" } else { "image/webp" }
+				);
+				assert!(
+					response.headers()[header::CONTENT_DISPOSITION]
+						.to_str()
+						.unwrap()
+						.ends_with(if avif { ".avif\"" } else { ".webp\"" })
+				);
+				let etag = response.headers()[header::ETAG].clone();
+				let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+				assert_eq!(body, stored, "{url}");
+				let response = app
+					.clone()
+					.oneshot(
+						Request::builder()
+							.uri(url)
+							.header(header::IF_NONE_MATCH, etag)
+							.body(Body::empty())
+							.unwrap(),
+					)
+					.await
+					.unwrap();
+				assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+				assert!(
+					to_bytes(response.into_body(), 1024)
+						.await
+						.unwrap()
+						.is_empty()
+				);
+				let response = app
+					.clone()
+					.oneshot(
+						Request::builder()
+							.method("HEAD")
+							.uri(url)
+							.body(Body::empty())
+							.unwrap(),
+					)
+					.await
+					.unwrap();
+				assert_eq!(response.status(), StatusCode::OK);
+				assert_eq!(
+					response.headers()[header::CONTENT_TYPE],
+					if avif { "image/avif" } else { "image/webp" }
+				);
+				assert!(
+					to_bytes(response.into_body(), 1024)
+						.await
+						.unwrap()
+						.is_empty()
+				);
+			}
+			let response = app
+				.clone()
+				.oneshot(
+					Request::builder()
+						.uri("/api/asset/map/s1d1/00")
+						.header(header::ACCEPT, "image/avif")
+						.body(Body::empty())
+						.unwrap(),
+				)
+				.await
+				.unwrap();
+			assert_eq!(response.status(), StatusCode::OK);
+			assert_eq!(response.headers()[header::CONTENT_TYPE], "image/jpeg");
+			let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+			assert_eq!(
+				image::guess_format(&body).unwrap(),
+				image::ImageFormat::Jpeg
+			);
+			for url in ["/i/000000/000001.png", "/i/000000/000001.png?format=png"] {
+				let response = app
+					.clone()
+					.oneshot(
+						Request::builder()
+							.uri(url)
+							.header(header::ACCEPT, "image/png")
+							.body(Body::empty())
+							.unwrap(),
+					)
+					.await
+					.unwrap();
+				assert_eq!(response.status(), StatusCode::OK);
+				assert_eq!(
+					response.headers()[header::CONTENT_TYPE],
+					if avif { "image/avif" } else { "image/webp" }
+				);
+			}
+		}
+	}
+
+	#[tokio::test]
+	async fn avif_rejects_encoding_and_composition_requests() {
+		for (avif, url, message) in [
+			(
+				false,
+				"/api/asset?path=ui/icon/000000/000001.tex&format=avif",
+				"AVIF encoding is not supported",
+			),
+			(false, "/api/asset/map/s1d1/00?format=avif", "composed maps"),
+			(true, "/api/asset/map/s1d1/00?format=avif", "composed maps"),
+		] {
+			let response = fixture_with_format(avif)
+				.await
+				.oneshot(
+					Request::builder()
+						.uri(url)
+						.header(header::IF_NONE_MATCH, "*")
+						.body(Body::empty())
+						.unwrap(),
+				)
+				.await
+				.unwrap();
+			assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+			assert!(!response.headers().contains_key(header::CACHE_CONTROL));
+			let body = to_bytes(response.into_body(), 4096).await.unwrap();
+			let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+			assert!(error["message"].as_str().unwrap().contains(message));
+		}
+	}
+
+	#[test]
+	fn schema_distinguishes_file_formats_from_map_formats() {
+		let file = serde_json::to_value(schemars::schema_for!(AssetQuery)).unwrap();
+		assert!(
+			!file["required"]
+				.as_array()
+				.unwrap()
+				.contains(&serde_json::json!("format"))
+		);
+		assert!(file.to_string().contains("avif"));
+		let map = serde_json::to_value(schemars::schema_for!(MapQuery)).unwrap();
+		assert_eq!(map["properties"]["format"]["default"], "jpg");
+		assert_eq!(
+			map["properties"]["format"]["enum"],
+			serde_json::json!(["jpg", "png", "webp"])
+		);
+	}
+
+	#[tokio::test]
 	async fn upstream_formats_and_legacy_raw_icons() {
 		let app = fixture().await;
 		for (url, mime, format) in [
@@ -625,8 +892,13 @@ mod tests {
 				.is_empty()
 		);
 		for (url, status) in [
+			("/api/asset?format=png", StatusCode::BAD_REQUEST),
 			(
-				"/api/asset?path=ui/icon/000000/000001.tex",
+				"/api/asset?path=ui/icon/000000/000001.tex&format=",
+				StatusCode::BAD_REQUEST,
+			),
+			(
+				"/api/asset?path=ui/icon/000000/000001.tex&format=gif",
 				StatusCode::BAD_REQUEST,
 			),
 			(

@@ -77,8 +77,15 @@ impl Service {
 			return Ok(bytes);
 		}
 		let (source, bytes) = self.raw(snapshot, &path).await?;
-		if source.format == bm_asset_index::Format::Webp && format == Format::Webp {
+		if matches!(
+			(source.format, format),
+			(bm_asset_index::Format::Webp, Format::Webp)
+				| (bm_asset_index::Format::Avif, Format::Avif)
+		) {
 			return Ok(bytes);
+		}
+		if format == Format::Avif {
+			return Err(Error::Invalid("format=avif only supports unchanged AVIF source objects; AVIF encoding is not supported".into()));
 		}
 		let permit = self
 			.workers
@@ -104,6 +111,9 @@ impl Service {
 		index: &str,
 		format: Format,
 	) -> Result<Bytes> {
+		if format == Format::Avif {
+			return Err(Error::Invalid("composed maps support only jpg, png and webp; use /api/asset with a source texture path for AVIF passthrough".into()));
+		}
 		let territory = territory.to_ascii_lowercase();
 		if territory.is_empty()
 			|| territory.len() > 64

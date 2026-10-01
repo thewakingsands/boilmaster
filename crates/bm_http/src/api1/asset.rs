@@ -11,8 +11,8 @@ use aide::{
 };
 use axum::{
 	debug_handler,
-	extract::{FromRef, OriginalUri, Request, State},
-	http::{StatusCode, header},
+	extract::{FromRef, FromRequestParts, OriginalUri, Request, State},
+	http::{StatusCode, header, request::Parts},
 	middleware,
 	response::{IntoResponse, Response},
 };
@@ -29,34 +29,36 @@ use schemars::{
 use seahash::SeaHasher;
 use serde::{Deserialize, Serialize};
 
-use crate::service::Service;
+use crate::service;
 
 use super::{
-	api::ApiState,
-	error::Result,
-	extract::{Path, Query, VersionQuery},
+	error::{Error, Result},
+	extract::{Path, Query},
 	jsonschema::impl_jsonschema,
 };
 
 // NOTE: Bump this if changing any behavior that impacts output binary data for assets, to ensure ETag is cache-broken.
-const ASSET_ETAG_VERSION: usize = 4;
+const ASSET_ETAG_VERSION: usize = 5;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
 	maxage: u64,
 }
 
+impl Default for Config {
+	fn default() -> Self {
+		Self { maxage: 604800 }
+	}
+}
+
 #[derive(Clone, FromRef)]
 struct AssetState {
-	services: Service,
+	asset: service::Asset,
 	config: Config,
 }
 
-pub fn router(config: Config, state: ApiState) -> ApiRouter {
-	let state = AssetState {
-		services: state.services,
-		config,
-	};
+pub fn router(config: Config, asset: service::Asset) -> ApiRouter {
+	let state = AssetState { asset, config };
 
 	ApiRouter::new()
 		.api_route("/", get_with(asset2, asset2_docs))
@@ -65,6 +67,75 @@ pub fn router(config: Config, state: ApiState) -> ApiRouter {
 		.route("/{*path}", axum::routing::get(asset1))
 		.layer(middleware::from_fn_with_state(state.clone(), cache_layer))
 		.with_state(state)
+}
+
+pub fn legacy_router(config: Config, asset: service::Asset) -> axum::Router {
+	let state = AssetState { asset, config };
+	axum::Router::new()
+		.route("/{*path}", axum::routing::get(legacy_icon))
+		.layer(middleware::from_fn_with_state(state.clone(), cache_layer))
+		.layer(tower_http::cors::CorsLayer::permissive())
+		.with_state(state)
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct VersionParams {
+	/// Asset snapshot version, or `latest` (the snapshot selected at startup).
+	version: Option<String>,
+}
+
+#[derive(aide::OperationIo)]
+#[aide(input_with = "Query<VersionParams>")]
+struct AssetVersion(bm_asset::Snapshot);
+
+impl FromRequestParts<AssetState> for AssetVersion {
+	type Rejection = Error;
+	async fn from_request_parts(parts: &mut Parts, state: &AssetState) -> Result<Self> {
+		if let Some(snapshot) = parts.extensions.get::<bm_asset::Snapshot>() {
+			return Ok(Self(snapshot.clone()));
+		}
+		let Query(query) = Query::<VersionParams>::from_request_parts(parts, state).await?;
+		let snapshot = state.asset.snapshot(query.version.as_deref()).await?;
+		parts.extensions.insert(snapshot.clone());
+		Ok(Self(snapshot))
+	}
+}
+
+async fn legacy_icon(
+	Path(Asset1Path { path }): Path<Asset1Path>,
+	AssetVersion(snapshot): AssetVersion,
+	State(asset): State<service::Asset>,
+) -> Result<Response> {
+	let (group, name) = path
+		.split_once('/')
+		.ok_or_else(|| Error::NotFound(path.clone()))?;
+	let stem = name
+		.strip_suffix(".png")
+		.ok_or_else(|| Error::NotFound(path.clone()))?;
+	let (id, hr) = stem
+		.strip_suffix("_hr1")
+		.map_or((stem, false), |id| (id, true));
+	if group.len() != 6
+		|| !group.bytes().all(|b| b.is_ascii_digit())
+		|| id.len() != 6
+		|| !id.bytes().all(|b| b.is_ascii_digit())
+	{
+		return Err(Error::NotFound(path));
+	}
+	let id: u32 = id.parse().map_err(|_| Error::NotFound(path.clone()))?;
+	// The Go endpoint ignored the supplied group and resolved by ID + HR.
+	let game_path = format!(
+		"ui/icon/{:06}/{id:06}{}.tex",
+		id / 1000 * 1000,
+		if hr { "_hr1" } else { "" }
+	);
+	let (source, bytes) = asset.raw(&snapshot, &game_path).await?;
+	let content_type = match source.format.extension() {
+		"webp" => "image/webp",
+		"avif" => "image/avif",
+		_ => "application/octet-stream",
+	};
+	Ok(([(header::CONTENT_TYPE, content_type)], bytes).into_response())
 }
 
 // Original asset endpoint based on a game path in the url path.
@@ -82,9 +153,9 @@ struct Asset1Query {
 #[debug_handler(state = AssetState)]
 async fn asset1(
 	Path(Asset1Path { path }): Path<Asset1Path>,
-	query_version: VersionQuery,
+	query_version: AssetVersion,
 	Query(Asset1Query { format }): Query<Asset1Query>,
-	state_service: State<Service>,
+	state_service: State<service::Asset>,
 ) -> Result<impl IntoApiResponse> {
 	// The endpoints are nearly identical - just call through to the new endpoint with an emulated query.
 	asset2(
@@ -152,16 +223,15 @@ fn asset2_docs(operation: TransformOperation) -> TransformOperation {
 
 #[debug_handler(state = AssetState)]
 async fn asset2(
-	VersionQuery(version_key): VersionQuery,
+	AssetVersion(snapshot): AssetVersion,
 	Query(AssetQuery {
 		path,
 		format: SchemaFormat(format),
 	}): Query<AssetQuery>,
-	State(Service { asset, .. }): State<Service>,
+	State(asset): State<service::Asset>,
 ) -> Result<impl IntoApiResponse> {
 	// Perform the conversion.
-	// TODO: can this be made async?
-	let bytes = asset.convert(version_key, &path, format)?;
+	let bytes = asset.convert(&snapshot, &path, format).await?;
 
 	// Try to derive a filename to use for the Content-Disposition header.
 	let filepath = std::path::Path::new(&path).with_extension(format.extension());
@@ -242,16 +312,16 @@ fn map_docs(operation: TransformOperation) -> TransformOperation {
 		.response_with::<304, (), _>(|res| res.description("not modified"))
 }
 
-#[debug_handler]
+#[debug_handler(state = AssetState)]
 async fn map(
 	Path(MapPath { territory, index }): Path<MapPath>,
-	VersionQuery(version_key): VersionQuery,
+	AssetVersion(snapshot): AssetVersion,
 	Query(MapQuery {
 		format: SchemaFormat(format),
 	}): Query<MapQuery>,
-	State(Service { asset, .. }): State<Service>,
+	State(asset): State<service::Asset>,
 ) -> Result<impl IntoApiResponse> {
-	let bytes = asset.map(version_key, &territory, &index, format)?;
+	let bytes = asset.map(&snapshot, &territory, &index, format).await?;
 
 	let response = (
 		TypedHeader(ContentType::from(format_mime(format))),
@@ -270,7 +340,7 @@ async fn map(
 
 async fn cache_layer(
 	uri: OriginalUri,
-	VersionQuery(version): VersionQuery,
+	AssetVersion(snapshot): AssetVersion,
 	header_if_none_match: Option<TypedHeader<IfNoneMatch>>,
 	State(config): State<Config>,
 	request: Request,
@@ -281,19 +351,21 @@ async fn cache_layer(
 	uri.hash(&mut hasher);
 	let uri_hash = hasher.finish();
 
-	let etag = format!("\"{uri_hash:016x}.{version}.{ASSET_ETAG_VERSION}\"")
-		.parse::<ETag>()
-		.expect("malformed etag");
+	let etag = format!(
+		"\"{uri_hash:016x}.{}.{ASSET_ETAG_VERSION}\"",
+		snapshot.index.fingerprint()
+	)
+	.parse::<ETag>()
+	.expect("malformed etag");
 
-	// If the request came through with a passing ETag, we can skip doing any processing.
-	if let Some(TypedHeader(if_none_match)) = header_if_none_match {
-		if !if_none_match.precondition_passes(&etag) {
-			return StatusCode::NOT_MODIFIED.into_response();
-		}
-	}
-
-	// ETag didn't match, pass down to the rest of the handlers.
+	// Validate the resource/request before returning 304. Never cache errors.
 	let mut response = next.run(request).await;
+	if !response.status().is_success() {
+		return response;
+	}
+	if header_if_none_match.is_some_and(|TypedHeader(value)| !value.precondition_passes(&etag)) {
+		response = StatusCode::NOT_MODIFIED.into_response();
+	}
 
 	// Add cache headers.
 	let cache_control = CacheControl::new()
@@ -306,4 +378,289 @@ async fn cache_layer(
 	headers.typed_insert(cache_control);
 
 	response
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use axum::{
+		Router,
+		body::{Body, to_bytes},
+	};
+	use bm_asset_index::{AssetRef, Reader, path_hash};
+	use bytes::Bytes;
+	use object_store::{ObjectStore, memory::InMemory, path::Path as ObjectPath};
+	use std::{io::Cursor, sync::Arc};
+	use tower::ServiceExt;
+
+	async fn fixture() -> Router {
+		fixture_with_format(false).await
+	}
+
+	async fn fixture_with_format(avif: bool) -> Router {
+		let store = Arc::new(InMemory::new());
+		let mut data = Cursor::new(Vec::new());
+		image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+			2,
+			2,
+			image::Rgba([128, 80, 40, 255]),
+		))
+		.write_to(&mut data, image::ImageFormat::WebP)
+		.unwrap();
+		let data = if avif {
+			let hex = include_str!("../../../bm_asset_fs/tests/fixtures/rgba.avif.hex").trim();
+			(0..hex.len())
+				.step_by(2)
+				.map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+				.collect()
+		} else {
+			data.into_inner()
+		};
+		let source = AssetRef {
+			sha256: [1; 32],
+			format: if avif {
+				bm_asset_index::Format::Avif
+			} else {
+				bm_asset_index::Format::Webp
+			},
+		};
+		store
+			.put(
+				&ObjectPath::from(source.object_path()),
+				Bytes::from(data).into(),
+			)
+			.await
+			.unwrap();
+		let mut keys = [
+			"ui/icon/000000/000001.tex",
+			"ui/icon/000000/000001_hr1.tex",
+			"ui/map/s1d1/00/s1d100_m.tex",
+			"ui/map/s1d1/00/s1d100m_m.tex",
+		]
+		.map(|path| path_hash(path).unwrap());
+		keys.sort_unstable();
+		let mut index = vec![0u8; 64];
+		index[..4].copy_from_slice(b"IXAS");
+		index[4..6].copy_from_slice(&1u16.to_le_bytes());
+		index[6..8].copy_from_slice(&64u16.to_le_bytes());
+		index[12..14].copy_from_slice(&44u16.to_le_bytes());
+		index[14..16].copy_from_slice(&1u16.to_le_bytes());
+		index[16..20].copy_from_slice(&(keys.len() as u32).to_le_bytes());
+		index[20..24].copy_from_slice(&64u32.to_le_bytes());
+		for key in keys {
+			index.extend_from_slice(&key.to_le_bytes());
+			index.extend_from_slice(&source.sha256);
+			index.extend_from_slice(&[if avif { 2 } else { 1 }, 0, 0, 0]);
+		}
+		let length = index.len() as u32;
+		index[24..28].copy_from_slice(&length.to_le_bytes());
+		let checksum = crc32fast::hash(&index[64..]);
+		index[28..32].copy_from_slice(&checksum.to_le_bytes());
+		store
+			.put(
+				&ObjectPath::from("patches/1/assets.bin"),
+				Bytes::from(index).into(),
+			)
+			.await
+			.unwrap();
+		let reader = Reader::with_store(store, "", None, Some("1".into()))
+			.await
+			.unwrap();
+		let service = Arc::new(bm_asset::Service::from_reader(Some(Arc::new(reader))));
+		let mut openapi = openapi::OpenApi::default();
+		Router::new()
+			.nest(
+				"/api/asset",
+				router(Config::default(), service.clone()).finish_api(&mut openapi),
+			)
+			.nest("/i", legacy_router(Config::default(), service))
+	}
+
+	#[tokio::test]
+	async fn avif_source_routes_and_raw_legacy_response() {
+		let app = fixture_with_format(true).await;
+		for (format, mime, expected) in [
+			("png", "image/png", image::ImageFormat::Png),
+			("jpg", "image/jpeg", image::ImageFormat::Jpeg),
+			("webp", "image/webp", image::ImageFormat::WebP),
+		] {
+			for url in [
+				format!("/api/asset?path=ui/icon/000000/000001.tex&format={format}"),
+				format!("/api/asset/map/s1d1/00?format={format}"),
+			] {
+				let response = app
+					.clone()
+					.oneshot(Request::builder().uri(&url).body(Body::empty()).unwrap())
+					.await
+					.unwrap();
+				assert_eq!(response.status(), StatusCode::OK, "{url}");
+				assert_eq!(response.headers()[header::CONTENT_TYPE], mime);
+				let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+				assert_eq!(image::guess_format(&body).unwrap(), expected);
+				assert_eq!(image::load_from_memory(&body).unwrap().width(), 2);
+			}
+		}
+		let response = app
+			.oneshot(
+				Request::builder()
+					.uri("/i/000000/000001.png")
+					.body(Body::empty())
+					.unwrap(),
+			)
+			.await
+			.unwrap();
+		assert_eq!(response.status(), StatusCode::OK);
+		assert_eq!(response.headers()[header::CONTENT_TYPE], "image/avif");
+		let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+		let expected = include_str!("../../../bm_asset_fs/tests/fixtures/rgba.avif.hex").trim();
+		assert_eq!(
+			body.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+			expected
+		);
+	}
+
+	#[tokio::test]
+	async fn upstream_formats_and_legacy_raw_icons() {
+		let app = fixture().await;
+		for (url, mime, format) in [
+			(
+				"/api/asset?path=ui/icon/000000/000001.tex&format=png",
+				"image/png",
+				image::ImageFormat::Png,
+			),
+			(
+				"/api/asset/ui/icon/000000/000001.tex?format=webp",
+				"image/webp",
+				image::ImageFormat::WebP,
+			),
+			(
+				"/api/asset/map/s1d1/00",
+				"image/jpeg",
+				image::ImageFormat::Jpeg,
+			),
+			(
+				"/api/asset/map/s1d1/00?format=png&version=1",
+				"image/png",
+				image::ImageFormat::Png,
+			),
+			(
+				"/i/999999/000001.png",
+				"image/webp",
+				image::ImageFormat::WebP,
+			),
+			(
+				"/i/000000/000001_hr1.png",
+				"image/webp",
+				image::ImageFormat::WebP,
+			),
+		] {
+			let response = app
+				.clone()
+				.oneshot(Request::builder().uri(url).body(Body::empty()).unwrap())
+				.await
+				.unwrap();
+			assert_eq!(response.status(), StatusCode::OK, "{url}");
+			assert_eq!(response.headers()[header::CONTENT_TYPE], mime);
+			assert!(response.headers().contains_key(header::ETAG));
+			let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+			assert_eq!(image::guess_format(&body).unwrap(), format);
+			if url.contains("map") && format == image::ImageFormat::Png {
+				assert_eq!(
+					image::load_from_memory(&body)
+						.unwrap()
+						.into_rgba8()
+						.get_pixel(0, 0)
+						.0,
+					[64, 25, 6, 255]
+				);
+			}
+		}
+	}
+
+	#[tokio::test]
+	async fn cache_validation_and_errors() {
+		let app = fixture().await;
+		let url = "/api/asset?path=ui/icon/000000/000001.tex&format=png";
+		let response = app
+			.clone()
+			.oneshot(Request::builder().uri(url).body(Body::empty()).unwrap())
+			.await
+			.unwrap();
+		assert_eq!(response.status(), StatusCode::OK);
+		let etag = response.headers()[header::ETAG].clone();
+		let response = app
+			.clone()
+			.oneshot(
+				Request::builder()
+					.uri(url)
+					.header(header::IF_NONE_MATCH, etag)
+					.body(Body::empty())
+					.unwrap(),
+			)
+			.await
+			.unwrap();
+		assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+		assert!(
+			to_bytes(response.into_body(), 1024)
+				.await
+				.unwrap()
+				.is_empty()
+		);
+		let response = app
+			.clone()
+			.oneshot(
+				Request::builder()
+					.method("HEAD")
+					.uri(url)
+					.body(Body::empty())
+					.unwrap(),
+			)
+			.await
+			.unwrap();
+		assert_eq!(response.status(), StatusCode::OK);
+		assert!(
+			to_bytes(response.into_body(), 1024)
+				.await
+				.unwrap()
+				.is_empty()
+		);
+		for (url, status) in [
+			(
+				"/api/asset?path=ui/icon/000000/000001.tex",
+				StatusCode::BAD_REQUEST,
+			),
+			(
+				"/api/asset?path=ui/icon/000000/000001.tex&format=avif",
+				StatusCode::BAD_REQUEST,
+			),
+			(
+				"/api/asset?path=ui/icon/000000/000001.tex&format=png&version=missing",
+				StatusCode::BAD_REQUEST,
+			),
+			(
+				"/api/asset?path=ui/../secret.tex&format=png",
+				StatusCode::BAD_REQUEST,
+			),
+			(
+				"/api/asset?path=ui/icon/000000/999999.tex&format=png",
+				StatusCode::NOT_FOUND,
+			),
+			("/i/000000/000002.png", StatusCode::NOT_FOUND),
+			("/i/000000/000001.webp", StatusCode::NOT_FOUND),
+		] {
+			let response = app
+				.clone()
+				.oneshot(
+					Request::builder()
+						.uri(url)
+						.header(header::IF_NONE_MATCH, "*")
+						.body(Body::empty())
+						.unwrap(),
+				)
+				.await
+				.unwrap();
+			assert_eq!(response.status(), status, "{url}");
+			assert!(!response.headers().contains_key(header::CACHE_CONTROL));
+		}
+	}
 }

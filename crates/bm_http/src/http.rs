@@ -57,7 +57,10 @@ pub async fn serve(
 		},
 	};
 
+	let legacy_assets =
+		api1::legacy_asset_router(config.api1.asset.clone(), state.services.asset.clone());
 	let router = Router::new()
+		.nest("/i", legacy_assets)
 		.nest("/api", api1::router(config.api1, state.clone()))
 		.nest("/health", health::router(state))
 		.fallback_service(ServeDir::new(directory))

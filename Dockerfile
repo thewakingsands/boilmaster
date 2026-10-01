@@ -1,9 +1,9 @@
 ARG target=""
 # Setup chef
 # NOTE: See /rust-toolchain.toml when updating.
-FROM --platform=$BUILDPLATFORM rust:1.85.0-slim-bookworm AS base
+FROM --platform=$BUILDPLATFORM rust:1.98.1-slim-bookworm AS base
 
-RUN apt-get update && apt-get install pkg-config libssl-dev git -y
+RUN apt-get update && apt-get install pkg-config libssl-dev git nasm -y
 
 # TODO: Try and get https://github.com/cross-rs/cross working to simplify this.
 ARG arch
@@ -58,6 +58,9 @@ ENV BM_READ_LANGUAGE_EXCLUDE="[ja,en,de,fr,ko]"
 
 # Downloaded ixion releases
 ENV BM_GAME_DIRECTORY="/app/persist/game"
+
+# Immutable asset objects cached independently from downloaded EXD releases.
+ENV BM_ASSET_CACHE="/app/persist/assets"
 
 
 # CAFE: serve static files

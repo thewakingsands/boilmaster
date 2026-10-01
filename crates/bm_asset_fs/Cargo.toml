@@ -1,0 +1,26 @@
+[package]
+name = "bm_asset"
+description = "Index-backed asset conversion and map composition for boilmaster"
+version = "0.0.0"
+publish = false
+
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+bm_asset_index = { path = "../bm_asset_index" }
+
+anyhow.workspace = true
+avif-decode.workspace = true
+bytes.workspace = true
+image = { workspace = true, features = ["jpeg", "png", "webp"] }
+mini-moka.workspace = true
+serde.workspace = true
+strum.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["rt", "sync"] }
+
+[dev-dependencies]
+serde_json.workspace = true

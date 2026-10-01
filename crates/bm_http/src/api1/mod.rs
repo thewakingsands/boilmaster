@@ -13,3 +13,4 @@ mod value;
 mod version;
 
 pub use api::{Config, router};
+pub use asset::legacy_router as legacy_asset_router;

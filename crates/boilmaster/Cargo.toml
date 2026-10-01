@@ -9,7 +9,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-bm_asset = { path = "../bm_asset" }
+bm_asset = { path = "../bm_asset_fs" }
 bm_data = { path = "../bm_data_fs" }
 bm_http = { path = "../bm_http" }
 bm_read = { path = "../bm_read" }

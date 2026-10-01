@@ -1,5 +1,5 @@
 [package]
-name = "bm_asset"
+name = "bm_asset_bak"
 description = "Asset composition & conversion for boilmaster"
 version = "0.0.0"
 publish = false

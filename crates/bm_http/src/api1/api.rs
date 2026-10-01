@@ -16,12 +16,14 @@ use tower_http::cors::CorsLayer;
 
 use crate::{http::HttpState, service::Service};
 
-use super::{read::RowReaderState, search, sheet, version};
+use super::{asset, read::RowReaderState, search, sheet, version};
 
 const OPENAPI_JSON_ROUTE: &str = "/openapi.json";
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
+	#[serde(default)]
+	pub asset: asset::Config,
 	search: search::Config,
 	sheet: sheet::Config,
 }
@@ -41,6 +43,11 @@ pub fn router(config: Config, state: HttpState) -> Router {
 	};
 
 	ApiRouter::new()
+		.nest(
+			"/asset",
+			asset::router(config.asset, state.services.asset.clone())
+				.with_path_items(|item| item.tag("assets")),
+		)
 		.nest(
 			"/version",
 			version::router(state.clone()).with_path_items(|item| item.tag("versions")),
@@ -72,6 +79,11 @@ fn api_docs(api: TransformOpenApi) -> TransformOpenApi {
 	let mut api = api
 		.title("boilmaster")
 		.version(git_version!(prefix = "1-", fallback = "unknown"))
+		.tag(openapi::Tag {
+			name: "assets".into(),
+			description: Some("Game textures and composed maps from the IXAS index.".into()),
+			..Default::default()
+		})
 		.tag(openapi::Tag {
 			name: "search".into(),
 			description: Some(

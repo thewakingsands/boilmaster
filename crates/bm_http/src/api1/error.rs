@@ -27,6 +27,8 @@ impl From<bm_asset::Error> for Error {
 	fn from(error: bm_asset::Error) -> Self {
 		use bm_asset::Error as AE;
 		match error {
+			AE::Invalid(message) => Self::Invalid(message),
+			AE::Unavailable => Self::Unavailable("asset service is disabled".into()),
 			AE::NotFound(..) => Self::NotFound(error.to_string()),
 			AE::UnsupportedSource(..) | AE::InvalidConversion(..) | AE::UnknownFormat(..) => {
 				Self::Invalid(error.to_string())

@@ -3,5 +3,5 @@
 # - /Cargo.toml
 # - /Dockerfile
 # - /README.md
-channel = "1.85.0"
+channel = "1.98.1"
 components = ["rust-analyzer"]

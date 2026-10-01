@@ -44,6 +44,20 @@ exclude = []
 # Downloaded ixion releases; keep this directory writable and persistent.
 directory = "game"
 
+[asset]
+# Enable only after configuring a read-only MinIO account below or via BM_ASSET_*.
+enabled = false
+prefix = "ixion/ui/sdo"
+region = "us-east-1"
+# endpoint = "https://minio.example.com"
+# bucket = "assets"
+# accesskey = "..."
+# secretkey = "..."
+# cache = "asset-cache"
+# version = "2026.09.15.0000.0000" # Otherwise use current.json at startup.
+# For offline access, use directory instead of MinIO and set prefix = "".
+# directory = "D:/Projects/ff14/ixion/storage/ui/sdo"
+
 [schema]
 default = "exdschema"
 interval = 3600       # 1 hour

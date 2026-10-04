@@ -1,7 +1,5 @@
 mod admin;
 mod auth;
-mod base;
-mod version;
-mod versions;
+pub(crate) mod docs;
 
 pub use admin::{Config, router};

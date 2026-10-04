@@ -1,0 +1,13 @@
+:root { color-scheme: light dark; font: 16px/1.6 system-ui, sans-serif; }
+body { margin: 0; background: light-dark(#f4f5f7, #15171b); color: light-dark(#19212d, #e5e8ed); }
+main { max-width: 1100px; margin: 0 auto; padding: 2rem 1.25rem; }
+h1 { margin-bottom: .25rem; } h2 { margin-top: 0; }
+section { margin: 1.5rem 0; padding: 1.5rem; border: 1px solid light-dark(#d8dde5, #414854); background: light-dark(#fff, #21252c); border-radius: .5rem; }
+button { padding: .65rem 1rem; border: 0; border-radius: .3rem; background: #245fb3; color: #fff; font: inherit; cursor: pointer; }
+button:disabled { opacity: .5; cursor: wait; }
+a { color: light-dark(#245fb3, #9fc6ff); }
+.table-scroll { overflow-x: auto; } table { border-collapse: collapse; width: 100%; margin-top: 1rem; text-align: left; }
+th, td { padding: .6rem; border-bottom: 1px solid light-dark(#d8dde5, #414854); }
+code { font-size: .8rem; overflow-wrap: anywhere; }
+#notice { white-space: pre-wrap; overflow-wrap: anywhere; }
+button:focus-visible, a:focus-visible { outline: 3px solid #d38b17; outline-offset: 3px; }

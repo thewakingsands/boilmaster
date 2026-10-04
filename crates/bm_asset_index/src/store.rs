@@ -78,6 +78,33 @@ pub struct Reader {
 }
 
 impl Reader {
+	pub fn pinned(&self) -> bool {
+		self.pinned
+	}
+
+	/// Locally loaded indexes only; never enumerate the object store.
+	pub fn snapshots(&self) -> Vec<Snapshot> {
+		let current = self
+			.current
+			.read()
+			.expect("asset snapshot lock poisoned")
+			.as_ref()
+			.expect("initialized")
+			.clone();
+		let mut snapshots: Vec<_> = self
+			.indexes
+			.iter()
+			.filter(|entry| entry.key() != &current.version)
+			.map(|entry| Snapshot {
+				version: entry.key().clone(),
+				index: entry.value().clone(),
+			})
+			.collect();
+		snapshots.sort_by(|a, b| b.version.cmp(&a.version));
+		snapshots.insert(0, current);
+		snapshots
+	}
+
 	pub async fn new(config: Config) -> Result<Self> {
 		let store: Arc<dyn ObjectStore> = if let Some(directory) = &config.directory {
 			Arc::new(LocalFileSystem::new_with_prefix(directory).map_err(storage_error)?)

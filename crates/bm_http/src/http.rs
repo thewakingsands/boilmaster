@@ -9,15 +9,16 @@ use axum::{
 use serde::Deserialize;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
-use tower_http::services::ServeDir;
 use tower_http::trace::{DefaultOnFailure, DefaultOnRequest, DefaultOnResponse, TraceLayer};
 use tracing::Level;
 
-use super::{api1, health, service};
+use super::{admin, api1, health, service};
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
 	api1: api1::Config,
+	#[serde(default)]
+	admin: admin::Config,
 
 	address: Option<IpAddr>,
 	port: u16,
@@ -59,11 +60,23 @@ pub async fn serve(
 
 	let legacy_assets =
 		api1::legacy_asset_router(config.api1.asset.clone(), state.services.asset.clone());
+	let docs = admin::docs::Docs::new(directory.into(), config.admin.docs.clone())?;
+	let admin = admin::router(
+		config.admin,
+		state.services.data.clone(),
+		state.services.asset.clone(),
+		docs.clone(),
+	)?;
 	let router = Router::new()
+		.route(
+			"/admin/",
+			axum::routing::get(|| async { axum::response::Redirect::temporary("/admin") }),
+		)
+		.nest("/admin", admin)
 		.nest("/i", legacy_assets)
 		.nest("/api", api1::router(config.api1, state.clone()))
 		.nest("/health", health::router(state))
-		.fallback_service(ServeDir::new(directory))
+		.fallback(axum::routing::get(admin::docs::serve).with_state(docs))
 		.layer(
 			TraceLayer::new_for_http()
 				// Add the matched route path to the spans.

@@ -1,9 +1,9 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use bm_asset_index::{Reader, Snapshot, normalize_path};
 use bytes::Bytes;
 use mini_moka::sync::Cache;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 use tokio::time::{self, Duration, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
@@ -75,6 +75,7 @@ mod tests {
 		time::advance(Duration::from_secs(1)).await;
 		tokio::task::yield_now().await;
 		assert_eq!(reader.snapshot(None).await.unwrap().version, "2");
+		assert!(reader.snapshots()[0].version == "2");
 
 		store
 			.put(
@@ -100,18 +101,112 @@ mod tests {
 		cancel.cancel();
 		task.await.unwrap().unwrap();
 	}
+
+	#[tokio::test]
+	async fn disabled_service_reports_reload_failure_and_releases_running_flag() {
+		let service = Service::from_reader(None);
+		assert!(!service.status().enabled);
+		assert!(service.status().indexes.is_empty());
+		assert!(service.reload().await.is_err());
+		let status = service.status();
+		assert!(!status.reload.running);
+		assert!(status.reload.error.is_some());
+		assert!(status.reload.checked_at.is_some());
+	}
 }
 
 pub struct Service {
 	reader: Option<Arc<Reader>>,
 	workers: Arc<Semaphore>,
 	encoded: Cache<String, Bytes>,
+	reload_status: Mutex<ReloadStatus>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct ReloadStatus {
+	pub running: bool,
+	pub checked_at: Option<u64>,
+	pub changed: Option<bool>,
+	pub error: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct IndexStatus {
+	pub version: String,
+	pub fingerprint: String,
+	pub entries: usize,
+	pub current: bool,
+}
+
+#[derive(Serialize)]
+pub struct Status {
+	pub enabled: bool,
+	pub pinned: bool,
+	pub indexes: Vec<IndexStatus>,
+	pub reload: ReloadStatus,
 }
 
 impl Service {
+	pub fn status(&self) -> Status {
+		Status {
+			enabled: self.reader.is_some(),
+			pinned: self.reader.as_ref().is_some_and(|reader| reader.pinned()),
+			indexes: self
+				.reader
+				.as_ref()
+				.map(|reader| {
+					reader
+						.snapshots()
+						.into_iter()
+						.enumerate()
+						.map(|(i, snapshot)| IndexStatus {
+							version: snapshot.version,
+							fingerprint: snapshot.index.fingerprint().into(),
+							entries: snapshot.index.len(),
+							current: i == 0,
+						})
+						.collect()
+				})
+				.unwrap_or_default(),
+			reload: self.reload_status.lock().expect("reload status").clone(),
+		}
+	}
+
+	pub async fn reload(&self) -> Result<bool> {
+		{
+			let mut status = self.reload_status.lock().expect("reload status");
+			if status.running {
+				return Err(Error::Invalid("asset reload already running".into()));
+			}
+			status.running = true;
+		}
+		// Drop also clears running when shutdown cancels the in-flight refresh.
+		struct Running<'a>(&'a Mutex<ReloadStatus>);
+		impl Drop for Running<'_> {
+			fn drop(&mut self) {
+				self.0.lock().expect("reload status").running = false;
+			}
+		}
+		let _running = Running(&self.reload_status);
+		let result = match self.reader() {
+			Ok(reader) => reader.reload().await.map_err(Error::from),
+			Err(error) => Err(error),
+		};
+		let mut status = self.reload_status.lock().expect("reload status");
+		status.checked_at = Some(
+			std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.unwrap_or_default()
+				.as_secs(),
+		);
+		status.changed = result.as_ref().ok().copied();
+		status.error = result.as_ref().err().map(ToString::to_string);
+		result
+	}
+
 	/// Run hourly refreshes alongside the HTTP service, not on the request path.
 	pub async fn start(&self, cancel: CancellationToken) -> Result<()> {
-		let Some(reader) = &self.reader else {
+		let Some(_) = &self.reader else {
 			return Ok(());
 		};
 		tokio::select! {
@@ -122,7 +217,7 @@ impl Service {
 				interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 				loop {
 					interval.tick().await;
-					if let Err(error) = reader.reload().await {
+					if let Err(error) = self.reload().await {
 						tracing::warn!(%error, "asset reload failed; retaining previous snapshot");
 					}
 				}
@@ -143,6 +238,7 @@ impl Service {
 	pub fn from_reader(reader: Option<Arc<Reader>>) -> Self {
 		Self {
 			reader,
+			reload_status: Mutex::new(ReloadStatus::default()),
 			workers: Arc::new(Semaphore::new(4)),
 			encoded: Cache::builder()
 				.max_capacity(64 * 1024 * 1024)

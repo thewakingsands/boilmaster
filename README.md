@@ -75,6 +75,61 @@ Example completed response:
 }
 ```
 
+### Administration and documentation sync
+
+The admin dashboard is available at `/admin/` when enabled. It shows retained
+data releases, the active data version and update status; currently loaded asset
+indexes, entry counts, fingerprints and refresh status; and the active synced
+documentation release. It offers data update, asset reload and documentation sync
+buttons. It does not offer version rollback or deletion. Asset versions are read
+from the in-process index cache, not by listing MinIO objects.
+
+Configure the following environment variables (there are no default credentials):
+
+```text
+BM_HTTP_ADMIN_ENABLED=true
+BM_HTTP_ADMIN_AUTH_USERNAME=<administrator name>
+BM_HTTP_ADMIN_AUTH_PASSWORD=<strong unique password>
+BM_HTTP_ADMIN_DOCS_REPOSITORY=thewakingsands/xivapi-v2
+BM_HTTP_DIRECTORY=/app/static
+```
+
+The dashboard is disabled by default and enabling it without nonempty credentials
+fails startup. Serve it behind HTTPS; restrict `/admin` at the reverse proxy to
+trusted operators where possible. Basic authentication protects pages, scripts,
+status and update endpoints. POST actions additionally require a per-process CSRF
+token obtained from the authenticated page. Admin responses are not cacheable.
+This login is separate from the existing `BM_UPDATE_TOKEN` API integration.
+The dashboard uses local scripts/styles and does not depend on an external CDN.
+
+Data updates use the existing asynchronous ixion updater and join an already
+running job. Asset reloads use the same atomic reader as the hourly refresh;
+failed validation keeps the previous index. When `BM_ASSET_VERSION` pins a version,
+the dashboard shows the pin and disables manual reload instead of overriding it.
+
+Documentation synchronization anonymously downloads `docs.zip` and
+`docs.zip.sha256` from the configured public repository's latest stable GitHub
+Release. Actions artifacts are not used because their download endpoint requires
+authentication. The documentation repository publishes these assets when `main`
+builds successfully; publishing does not automatically synchronize running servers.
+
+For server-side sync, mount a **writable, persistent** directory at `/app/static`
+(or `BM_HTTP_DIRECTORY`). The existing static files continue to work before the
+first sync. New releases are checksum-checked, size-limited and safely extracted
+under `.boilmaster-docs/<installation-id>/site`; a persisted `current.json` pointer
+is atomically replaced only after validating the Chinese, English and root entry
+pages. HTTP requests then use the new directory without restarting, and the
+selection survives restart. Failed syncs keep the previous site. Old installations
+are retained (there is no automatic disk cleanup or rollback UI). Avoid pointing
+an external static server at the mount root after syncing: only boilmaster follows
+the managed pointer and blocks direct access to its metadata directory. Share a
+volume with only one updating boilmaster process. A read-only mount remains valid
+for manual deployment, but the sync button will report a write failure.
+
+Documentation updates do not invalidate existing browser/CDN caches. Clear stale
+HTML caches if an immediate switch is needed. Before the first documentation
+Release is published, the sync action reports an error and leaves the site intact.
+
 ### Assets and migration from the Go service
 
 WebP and AVIF source objects are supported. AVIF decoding uses `avif-decode`/`rav1d` in Rust, without a system dav1d library. Alpha and high-bit-depth channels are preserved during decoding; JPEG and WebP responses are converted to 8-bit, while PNG can retain 16-bit channels. Map composition follows upstream's 8-bit RGBA behavior. Raw AVIF delivery through legacy `/i/` does not require decoding.

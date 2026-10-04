@@ -12,7 +12,7 @@ use aide::{
 use axum::{
 	debug_handler,
 	extract::{FromRef, FromRequestParts, OriginalUri, Request, State},
-	http::{StatusCode, header, request::Parts},
+	http::{HeaderMap, StatusCode, header, request::Parts},
 	middleware,
 	response::{IntoResponse, Response},
 };
@@ -38,7 +38,7 @@ use super::{
 };
 
 // NOTE: Bump this if changing any behavior that impacts output binary data for assets, to ensure ETag is cache-broken.
-const ASSET_ETAG_VERSION: usize = 5;
+const ASSET_ETAG_VERSION: usize = 6;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -151,12 +151,14 @@ async fn asset1(
 	query_version: AssetVersion,
 	Query(Asset1Query { format }): Query<Asset1Query>,
 	state_service: State<service::Asset>,
+	headers: HeaderMap,
 ) -> Result<impl IntoApiResponse> {
 	// The endpoints are nearly identical - just call through to the new endpoint with an emulated query.
 	asset2(
 		query_version,
 		Query(AssetQuery { path, format }),
 		state_service,
+		headers,
 	)
 	.await
 }
@@ -168,8 +170,9 @@ struct AssetQuery {
 	#[schemars(example = "example_path")]
 	path: String,
 
-	/// Optional output format. Omit to return the stored object unchanged.
-	/// Explicit `avif` is available only when the source is already AVIF.
+	/// Fallback output format when Accept does not allow the stored content type.
+	/// Omit to always return the stored object unchanged, regardless of Accept.
+	/// AVIF encoding is not supported; AVIF output requires an AVIF source.
 	#[schemars(example = "example_format")]
 	format: Option<SchemaFormat>,
 }
@@ -210,7 +213,7 @@ fn example_format() -> SchemaFormat {
 fn asset2_docs(operation: TransformOperation) -> TransformOperation {
 	operation
 		.summary("read an asset")
-		.description("Read an indexed asset at the specified game path. Omit format to return the stored object byte-for-byte with its original content type. Explicit jpg, png and webp select an output encoding; avif returns an existing AVIF object unchanged. Non-AVIF sources cannot be requested as avif (400).")
+		.description("Read an indexed asset at the specified game path. Omit format to return the stored object byte-for-byte regardless of Accept. With format specified, return the stored object unchanged if Accept allows its content type; otherwise use format as the fallback encoding. Missing or empty Accept uses the fallback. Responses vary by Accept. AVIF encoding is not supported: falling back to avif for a non-AVIF source returns 400.")
 		.response_with::<200, Vec<u8>, _>(|mut response| {
 			response.inner().content = Format::iter()
 				.map(|format| {
@@ -230,7 +233,16 @@ async fn asset2(
 	AssetVersion(snapshot): AssetVersion,
 	Query(AssetQuery { path, format }): Query<AssetQuery>,
 	State(asset): State<service::Asset>,
+	headers: HeaderMap,
 ) -> Result<impl IntoApiResponse> {
+	// Inspect the in-memory index before fetching anything: the conversion path
+	// may already be cached and must not incur an extra object-store request.
+	let source = snapshot
+		.index
+		.lookup(&path)
+		.map_err(bm_asset::Error::from)?
+		.ok_or_else(|| Error::NotFound(path.clone()))?;
+	let format = format.filter(|_| !accepts_stored(&headers, &stored_mime(source)));
 	let (bytes, content_type, extension) = match format {
 		Some(SchemaFormat(format)) => (
 			asset.convert(&snapshot, &path, format).await?,
@@ -257,11 +269,108 @@ async fn asset2(
 	let response = (
 		TypedHeader(ContentType::from(content_type)),
 		// TypedHeader only has a really naive inline value with no ability to customise :/
-		[(header::CONTENT_DISPOSITION, disposition)],
+		[
+			(header::CONTENT_DISPOSITION, disposition),
+			(header::VARY, "Accept".into()),
+		],
 		bytes,
 	);
 
 	Ok(response.into_response())
+}
+
+/// This is a passthrough preference, not full output-format negotiation: any
+/// positive quality for the stored type wins, even if PNG has a higher quality.
+/// Missing/empty Accept deliberately falls back to the query's format.
+fn accepts_stored(headers: &HeaderMap, stored: &mime::Mime) -> bool {
+	let mut best: Option<(u8, u16)> = None;
+	for value in headers.get_all(header::ACCEPT) {
+		let Ok(value) = value.to_str() else { continue };
+		// Commas inside quoted media parameters are not list separators.
+		let (mut quoted, mut escaped) = (false, false);
+		for range in value.split(|c| {
+			if escaped {
+				escaped = false;
+				return false;
+			}
+			match c {
+				'\\' if quoted => escaped = true,
+				'"' => quoted = !quoted,
+				',' if !quoted => return true,
+				_ => {}
+			}
+			false
+		}) {
+			let Ok(range) = range.trim().parse::<mime::Mime>() else {
+				continue;
+			};
+			if range.suffix() != stored.suffix() {
+				continue;
+			}
+			let specificity =
+				if range.type_() == stored.type_() && range.subtype() == stored.subtype() {
+					2
+				} else if range.type_() == stored.type_() && range.subtype() == mime::STAR {
+					1
+				} else if range.type_() == mime::STAR && range.subtype() == mime::STAR {
+					0
+				} else {
+					continue;
+				};
+			let mut quality = None;
+			let mut valid = true;
+			for (name, value) in range.params() {
+				if name == "q" {
+					if quality.is_some() {
+						valid = false;
+						break;
+					}
+					quality = accept_quality(value.as_str());
+					if quality.is_none() {
+						valid = false;
+						break;
+					}
+				} else {
+					// Stored types have no media parameters, so a parameterized
+					// range (e.g. image/avif;profile=...) cannot match them.
+					valid = false;
+					break;
+				}
+			}
+			if !valid {
+				continue;
+			}
+			let quality = quality.unwrap_or(1000);
+			// A specific q=0 excludes a type even in the presence of */*.
+			// For duplicate ranges at equal specificity, prefer exclusion.
+			match best {
+				Some((rank, q)) if rank == specificity => best = Some((rank, q.min(quality))),
+				Some((rank, _)) if rank > specificity => {}
+				_ => best = Some((specificity, quality)),
+			}
+		}
+	}
+	best.is_some_and(|(_, quality)| quality > 0)
+}
+
+fn accept_quality(value: &str) -> Option<u16> {
+	let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
+	if !matches!(whole, "0" | "1")
+		|| fraction.len() > 3
+		|| !fraction.bytes().all(|b| b.is_ascii_digit())
+	{
+		return None;
+	}
+	if whole == "1" {
+		return fraction.bytes().all(|b| b == b'0').then_some(1000);
+	}
+	Some(
+		fraction
+			.bytes()
+			.enumerate()
+			.map(|(i, b)| u16::from(b - b'0') * [100, 10, 1][i])
+			.sum(),
+	)
 }
 
 fn format_mime(format: Format) -> mime::Mime {
@@ -371,9 +480,19 @@ async fn cache_layer(
 	request: Request,
 	next: middleware::Next,
 ) -> Response {
-	// Build ETag for this request.
+	// Validate and select the representation before constructing its validator.
+	// The same URL can return different bytes depending on Accept.
+	let mut response = next.run(request).await;
+	if !response.status().is_success() {
+		return response;
+	}
+	// Build ETag for this request and its actual output format.
 	let mut hasher = SeaHasher::new();
 	uri.hash(&mut hasher);
+	response
+		.headers()
+		.get(header::CONTENT_TYPE)
+		.hash(&mut hasher);
 	let uri_hash = hasher.finish();
 
 	let etag = format!(
@@ -383,13 +502,17 @@ async fn cache_layer(
 	.parse::<ETag>()
 	.expect("malformed etag");
 
-	// Validate the resource/request before returning 304. Never cache errors.
-	let mut response = next.run(request).await;
-	if !response.status().is_success() {
-		return response;
-	}
 	if header_if_none_match.is_some_and(|TypedHeader(value)| !value.precondition_passes(&etag)) {
+		let vary: Vec<_> = response
+			.headers()
+			.get_all(header::VARY)
+			.iter()
+			.cloned()
+			.collect();
 		response = StatusCode::NOT_MODIFIED.into_response();
+		for value in vary {
+			response.headers_mut().append(header::VARY, value);
+		}
 	}
 
 	// Add cache headers.
@@ -499,6 +622,232 @@ mod tests {
 				router(Config::default(), service.clone()).finish_api(&mut openapi),
 			)
 			.nest("/i", legacy_router(Config::default(), service))
+			.layer(tower_http::cors::CorsLayer::permissive())
+	}
+
+	#[test]
+	fn accept_matching_respects_ranges_quality_and_specific_exclusions() {
+		for (values, expected) in [
+			(vec![], false),
+			(vec![""], false),
+			(vec![" , "], false),
+			(vec!["image/webp"], true),
+			(vec!["IMAGE/WEBP"], true),
+			(vec!["image/*"], true),
+			(vec!["*/*"], true),
+			(vec!["image/png, image/webp;q=0.001"], true),
+			(vec!["image/png", "image/webp"], true),
+			(vec!["image/webp;q=0", "*/*"], false),
+			(vec!["*/*,image/webp;q=0"], false),
+			(vec!["image/*;q=0, */*;q=1"], false),
+			(vec!["image/*;q=0, image/webp;q=0.5"], true),
+			(vec!["image/webp;q=1, image/webp;q=0"], false),
+			(vec!["image/webp;q=0.000"], false),
+			(vec!["image/webp;q=1.000"], true),
+			(vec!["image/webp;q=1.001"], false),
+			(vec!["image/webp;q=NaN"], false),
+			(vec!["image/webp;q=-1"], false),
+			(vec!["image/webp;q=0.0001"], false),
+			(vec!["image/webp;q=1;q=0"], false),
+			(vec!["image/png", "text/*"], false),
+			(vec!["*/webp"], false),
+			(vec!["image/webp+other"], false),
+			(vec!["image/webp;profile=other"], false),
+			(vec!["image/webp;profile=\"x,image/webp,y\""], false),
+			(vec!["invalid, image/webp"], true),
+		] {
+			let mut headers = HeaderMap::new();
+			for value in &values {
+				headers.append(header::ACCEPT, value.parse().unwrap());
+			}
+			assert_eq!(
+				accepts_stored(&headers, &format_mime(Format::Webp)),
+				expected,
+				"{values:?}"
+			);
+		}
+	}
+
+	fn assert_varies_by_accept(response: &Response) {
+		assert!(
+			response
+				.headers()
+				.get_all(header::VARY)
+				.iter()
+				.any(|value| {
+					value
+						.to_str()
+						.unwrap()
+						.split(',')
+						.any(|name| name.trim().eq_ignore_ascii_case("accept"))
+				})
+		);
+	}
+
+	#[tokio::test]
+	async fn accept_prefers_stored_bytes_and_falls_back_to_query_format() {
+		for avif in [false, true] {
+			let app = fixture_with_format(avif).await;
+			let mime = if avif { "image/avif" } else { "image/webp" };
+			let response = app
+				.clone()
+				.oneshot(
+					Request::builder()
+						.uri("/i/000000/000001.png")
+						.body(Body::empty())
+						.unwrap(),
+				)
+				.await
+				.unwrap();
+			let stored = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+			for url in [
+				"/api/asset?path=ui/icon/000000/000001.tex&format=png",
+				"/api/asset/ui/icon/000000/000001.tex?format=png",
+				"/api/asset?path=ui/map/s1d1/00/s1d100_m.tex&format=png",
+			] {
+				for accept in [
+					mime.to_owned(),
+					"image/*".into(),
+					"*/*".into(),
+					format!("image/png;q=1, {mime};q=0.1"),
+				] {
+					let response = app
+						.clone()
+						.oneshot(
+							Request::builder()
+								.uri(url)
+								.header(header::ACCEPT, accept)
+								.body(Body::empty())
+								.unwrap(),
+						)
+						.await
+						.unwrap();
+					assert_eq!(response.status(), StatusCode::OK);
+					assert_eq!(response.headers()[header::CONTENT_TYPE], mime);
+					assert!(
+						response.headers()[header::CONTENT_DISPOSITION]
+							.to_str()
+							.unwrap()
+							.ends_with(if avif { ".avif\"" } else { ".webp\"" })
+					);
+					assert_varies_by_accept(&response);
+					assert_eq!(
+						to_bytes(response.into_body(), 1024 * 1024).await.unwrap(),
+						stored
+					);
+				}
+				for accept in [
+					None,
+					Some("".to_owned()),
+					Some("image/png".into()),
+					Some(format!("{mime};q=0, */*")),
+				] {
+					let mut request = Request::builder().uri(url);
+					if let Some(accept) = accept {
+						request = request.header(header::ACCEPT, accept);
+					}
+					let response = app
+						.clone()
+						.oneshot(request.body(Body::empty()).unwrap())
+						.await
+						.unwrap();
+					assert_eq!(response.status(), StatusCode::OK);
+					assert_eq!(response.headers()[header::CONTENT_TYPE], "image/png");
+					assert_varies_by_accept(&response);
+					let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+					assert_eq!(
+						image::guess_format(&bytes).unwrap(),
+						image::ImageFormat::Png
+					);
+				}
+			}
+		}
+	}
+
+	#[tokio::test]
+	async fn negotiated_cache_validators_are_representation_specific() {
+		let app = fixture().await;
+		let url = "/api/asset?path=ui/icon/000000/000001.tex&format=png";
+		let response = app
+			.clone()
+			.oneshot(Request::builder().uri(url).body(Body::empty()).unwrap())
+			.await
+			.unwrap();
+		let png_etag = response.headers()[header::ETAG].clone();
+		let response = app
+			.clone()
+			.oneshot(
+				Request::builder()
+					.uri(url)
+					.header(header::ACCEPT, "image/webp")
+					.header(header::IF_NONE_MATCH, png_etag.clone())
+					.body(Body::empty())
+					.unwrap(),
+			)
+			.await
+			.unwrap();
+		assert_eq!(response.status(), StatusCode::OK);
+		assert_eq!(response.headers()[header::CONTENT_TYPE], "image/webp");
+		assert_varies_by_accept(&response);
+		let raw_etag = response.headers()[header::ETAG].clone();
+		assert_ne!(raw_etag, png_etag);
+		for (accept, etag) in [("*/*", raw_etag.clone()), ("image/png", png_etag)] {
+			let response = app
+				.clone()
+				.oneshot(
+					Request::builder()
+						.uri(url)
+						.header(header::ACCEPT, accept)
+						.header(header::IF_NONE_MATCH, etag)
+						.body(Body::empty())
+						.unwrap(),
+				)
+				.await
+				.unwrap();
+			assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+			assert_varies_by_accept(&response);
+			assert!(response.headers().contains_key(header::CACHE_CONTROL));
+			assert!(
+				to_bytes(response.into_body(), 1024)
+					.await
+					.unwrap()
+					.is_empty()
+			);
+		}
+		let response = app
+			.clone()
+			.oneshot(
+				Request::builder()
+					.method("HEAD")
+					.uri(url)
+					.header(header::ACCEPT, "image/webp")
+					.body(Body::empty())
+					.unwrap(),
+			)
+			.await
+			.unwrap();
+		assert_eq!(response.status(), StatusCode::OK);
+		assert_eq!(response.headers()[header::CONTENT_TYPE], "image/webp");
+		assert_eq!(response.headers()[header::ETAG], raw_etag);
+		assert_varies_by_accept(&response);
+		assert!(
+			to_bytes(response.into_body(), 1024)
+				.await
+				.unwrap()
+				.is_empty()
+		);
+		let response = app
+			.oneshot(
+				Request::builder()
+					.uri(url)
+					.header(header::IF_NONE_MATCH, raw_etag)
+					.body(Body::empty())
+					.unwrap(),
+			)
+			.await
+			.unwrap();
+		assert_eq!(response.status(), StatusCode::OK);
+		assert_eq!(response.headers()[header::CONTENT_TYPE], "image/png");
 	}
 
 	#[tokio::test]

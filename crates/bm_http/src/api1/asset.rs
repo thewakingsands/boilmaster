@@ -565,7 +565,10 @@ mod tests {
 			data.into_inner()
 		};
 		let source = AssetRef {
-			sha256: [1; 32],
+			chunk: uuid::Uuid::from_bytes([1; 16]),
+			chunk_size: data.len() as u32,
+			offset: 0,
+			size: data.len() as u32,
 			format: if avif {
 				bm_asset_index::Format::Avif
 			} else {
@@ -589,16 +592,23 @@ mod tests {
 		keys.sort_unstable();
 		let mut index = vec![0u8; 64];
 		index[..4].copy_from_slice(b"IXAS");
-		index[4..6].copy_from_slice(&1u16.to_le_bytes());
+		index[4..6].copy_from_slice(&2u16.to_le_bytes());
 		index[6..8].copy_from_slice(&64u16.to_le_bytes());
-		index[12..14].copy_from_slice(&44u16.to_le_bytes());
+		index[12..14].copy_from_slice(&20u16.to_le_bytes());
 		index[14..16].copy_from_slice(&1u16.to_le_bytes());
 		index[16..20].copy_from_slice(&(keys.len() as u32).to_le_bytes());
-		index[20..24].copy_from_slice(&64u32.to_le_bytes());
+		index[20..24].copy_from_slice(&88u32.to_le_bytes());
+		index[32..36].copy_from_slice(&1u32.to_le_bytes());
+		index[36..40].copy_from_slice(&64u32.to_le_bytes());
+		index[40..42].copy_from_slice(&24u16.to_le_bytes());
+		index.extend_from_slice(source.chunk.as_bytes());
+		index.extend_from_slice(&source.chunk_size.to_le_bytes());
+		index.extend_from_slice(&[0; 4]);
 		for key in keys {
 			index.extend_from_slice(&key.to_le_bytes());
-			index.extend_from_slice(&source.sha256);
-			index.extend_from_slice(&[if avif { 2 } else { 1 }, 0, 0, 0]);
+			index.extend_from_slice(&source.offset.to_le_bytes());
+			index.extend_from_slice(&source.size.to_le_bytes());
+			index.extend_from_slice(&[0, 0, if avif { 2 } else { 1 }, 0]);
 		}
 		let length = index.len() as u32;
 		index[24..28].copy_from_slice(&length.to_le_bytes());

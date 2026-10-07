@@ -1,4 +1,4 @@
-//! Read-only IXAS v1 lookup and storage, independent of HTTP and game EXD data.
+//! Read-only IXAS v2 chunk lookup and storage, independent of HTTP and game EXD data.
 mod index;
 mod store;
 
@@ -18,3 +18,12 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+pub(crate) fn test_index() -> Vec<u8> {
+	let hex = include_str!("../tests/fixtures/ixas-v2.hex").trim();
+	(0..hex.len())
+		.step_by(2)
+		.map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+		.collect()
+}

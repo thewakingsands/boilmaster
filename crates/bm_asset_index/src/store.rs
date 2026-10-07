@@ -1,13 +1,17 @@
 use std::{
+	collections::HashMap,
 	path::PathBuf,
-	sync::{Arc, RwLock},
+	sync::{Arc, Mutex as StdMutex, RwLock, Weak},
 };
 
 use bytes::{Bytes, BytesMut};
 use futures::TryStreamExt;
 use mini_moka::sync::Cache;
-use object_store::{ObjectStore, aws::AmazonS3Builder, local::LocalFileSystem, path::Path};
+use object_store::{
+	GetOptions, GetRange, ObjectStore, aws::AmazonS3Builder, local::LocalFileSystem, path::Path,
+};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, Semaphore};
 
 use crate::{AssetRef, Error, Index, Result};
@@ -75,6 +79,7 @@ pub struct Reader {
 	indexes: Cache<String, Arc<Index>>,
 	index_load: Mutex<()>,
 	requests: Semaphore,
+	flights: StdMutex<HashMap<String, Weak<Mutex<Option<Bytes>>>>>,
 }
 
 impl Reader {
@@ -131,7 +136,16 @@ impl Reader {
 					.map_err(storage_error)?,
 			)
 		};
-		Self::with_store(store, &config.prefix, config.cache, config.version).await
+		let cache = config.cache.map(|p| {
+			p.join(format!(
+				"{:x}",
+				Sha256::digest(format!(
+					"{}:{}:{}:{:?}",
+					config.endpoint, config.bucket, config.prefix, config.directory
+				))
+			))
+		});
+		Self::with_store(store, &config.prefix, cache, config.version).await
 	}
 
 	pub async fn with_store(
@@ -142,6 +156,8 @@ impl Reader {
 	) -> Result<Self> {
 		let prefix = prefix.trim_matches('/').to_owned();
 		Path::parse(&prefix).map_err(|_| Error::Invalid("invalid storage prefix".into()))?;
+		let cache =
+			cache.map(|p| p.join(format!("{:x}", Sha256::digest(format!("{store}:{prefix}")))));
 		let reader = Self {
 			store,
 			prefix,
@@ -151,6 +167,7 @@ impl Reader {
 			indexes: Cache::new(4),
 			index_load: Mutex::new(()),
 			requests: Semaphore::new(32),
+			flights: StdMutex::new(HashMap::new()),
 		};
 		let version = if let Some(version) = version {
 			version
@@ -262,19 +279,38 @@ impl Reader {
 			.index
 			.lookup(path)?
 			.ok_or_else(|| Error::NotFound(path.into()))?;
-		let object = entry.object_path();
+		let object = entry.cache_key();
+		let flight = {
+			let mut flights = self.flights.lock().expect("asset flights lock poisoned");
+			flights.retain(|_, v| v.strong_count() > 0);
+			if let Some(flight) = flights.get(&object).and_then(Weak::upgrade) {
+				flight
+			} else {
+				let flight = Arc::new(Mutex::new(None));
+				flights.insert(object.clone(), Arc::downgrade(&flight));
+				flight
+			}
+		};
+		let mut shared = flight.lock().await;
+		if let Some(bytes) = shared.as_ref() {
+			return Ok((entry, bytes.clone()));
+		}
 		if let Some(cache) = &self.cache {
 			let path = cache.join(&object);
 			match tokio::fs::metadata(&path).await {
-				Ok(meta) if meta.len() > 0 && meta.len() <= IMAGE_LIMIT as u64 => {
+				Ok(meta) if meta.len() == u64::from(entry.size) => {
 					if let Ok(bytes) = tokio::fs::read(path).await {
-						return Ok((entry, bytes.into()));
+						if bytes.len() == entry.size as usize {
+							let bytes: Bytes = bytes.into();
+							*shared = Some(bytes.clone());
+							return Ok((entry, bytes));
+						}
 					}
 				}
 				_ => {}
 			}
 		}
-		let bytes = self.fetch(&object, IMAGE_LIMIT).await?;
+		let bytes = self.fetch_range(entry).await?;
 		if bytes.is_empty() {
 			return Err(Error::Storage("empty image object".into()));
 		}
@@ -292,9 +328,54 @@ impl Reader {
 				tracing::warn!("could not persist asset cache entry");
 			}
 		}
+		*shared = Some(bytes.clone());
 		Ok((entry, bytes))
 	}
 
+	async fn fetch_range(&self, entry: AssetRef) -> Result<Bytes> {
+		let _permit = self
+			.requests
+			.acquire()
+			.await
+			.map_err(|_| Error::Storage("reader closed".into()))?;
+		let relative = entry.object_path();
+		let key = if self.prefix.is_empty() {
+			relative.clone()
+		} else {
+			format!("{}/{}", self.prefix, relative)
+		};
+		let path = Path::parse(key).map_err(|_| Error::Invalid("invalid chunk path".into()))?;
+		let range = entry.offset as usize..entry.offset as usize + entry.size as usize;
+		let result = self
+			.store
+			.get_opts(
+				&path,
+				GetOptions {
+					range: Some(GetRange::Bounded(range.clone())),
+					..Default::default()
+				},
+			)
+			.await
+			.map_err(|error| match error {
+				object_store::Error::NotFound { .. } => Error::NotFound(relative),
+				other => storage_error(other),
+			})?;
+		if result.range != range || result.meta.size != entry.chunk_size as usize {
+			return Err(Error::Storage("invalid chunk range or length".into()));
+		}
+		let mut stream = result.into_stream();
+		let mut bytes = BytesMut::with_capacity(entry.size as usize);
+		while let Some(part) = stream.try_next().await.map_err(storage_error)? {
+			if part.len() > entry.size as usize - bytes.len() {
+				return Err(Error::Storage("oversized chunk range".into()));
+			}
+			bytes.extend_from_slice(&part);
+		}
+		if bytes.len() != entry.size as usize || bytes.len() > IMAGE_LIMIT {
+			return Err(Error::Storage("truncated chunk range".into()));
+		}
+		Ok(bytes.freeze())
+	}
 	async fn fetch(&self, relative: &str, limit: usize) -> Result<Bytes> {
 		let _permit = self
 			.requests
@@ -351,17 +432,109 @@ mod tests {
 	use super::*;
 	use object_store::memory::InMemory;
 
-	fn golden() -> Bytes {
-		let hex = format!(
-			"4958415301004000000000002c00010001000000400000006c000000f9b87a16{}0ae203872dc9c845{}01000000",
-			"00".repeat(32),
-			"01".repeat(32)
+	#[tokio::test]
+	async fn coalesces_concurrent_ranges_and_rejects_truncated_chunks() {
+		let store = Arc::new(InMemory::new());
+		put(&store, "patches/1/assets.bin", golden()).await;
+		let reader = Arc::new(
+			Reader::with_store(store.clone(), "", None, Some("1".into()))
+				.await
+				.unwrap(),
 		);
-		(0..hex.len())
-			.step_by(2)
-			.map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
-			.collect::<Vec<_>>()
-			.into()
+		let snapshot = reader.snapshot(None).await.unwrap();
+		let path = "ui/icon/000000/000000.tex";
+		let entry = snapshot.index.lookup(path).unwrap().unwrap();
+		put(
+			&store,
+			&entry.object_path(),
+			Bytes::from_static(b"xximage bytesy"),
+		)
+		.await;
+		assert!(reader.read(&snapshot, path).await.is_err());
+		put(
+			&store,
+			&entry.object_path(),
+			Bytes::from_static(b"xximage bytesyy"),
+		)
+		.await;
+		let permits = reader.requests.acquire_many(32).await.unwrap();
+		let mut tasks = Vec::new();
+		for _ in 0..3 {
+			let reader = reader.clone();
+			let snapshot = snapshot.clone();
+			tasks.push(tokio::spawn(async move {
+				reader.read(&snapshot, path).await.unwrap().1
+			}));
+		}
+		for _ in 0..10 {
+			tokio::task::yield_now().await;
+		}
+		assert!(
+			reader
+				.flights
+				.lock()
+				.unwrap()
+				.get(&entry.cache_key())
+				.unwrap()
+				.strong_count()
+				>= 3
+		);
+		drop(permits);
+		for task in tasks {
+			assert_eq!(task.await.unwrap(), b"image bytes"[..]);
+		}
+	}
+
+	#[tokio::test]
+	async fn disk_cache_uses_physical_uuid_not_snapshot_chunk_number() {
+		let root = std::env::temp_dir().join(format!("bm-chunk-cache-{}", uuid::Uuid::new_v4()));
+		let store = Arc::new(InMemory::new());
+		put(&store, "patches/1/assets.bin", golden()).await;
+		let reader = Reader::with_store(store.clone(), "", Some(root.clone()), Some("1".into()))
+			.await
+			.unwrap();
+		let old = reader.snapshot(None).await.unwrap();
+		let path = "ui/icon/000000/000000.tex";
+		let entry = old.index.lookup(path).unwrap().unwrap();
+		put(
+			&store,
+			&entry.object_path(),
+			Bytes::from_static(b"xximage bytesyy"),
+		)
+		.await;
+		assert_eq!(reader.read(&old, path).await.unwrap().1, b"image bytes"[..]);
+		store
+			.delete(&Path::from(entry.object_path()))
+			.await
+			.unwrap();
+		let original = golden();
+		let mut b = original[..64].to_vec();
+		b.extend_from_slice(&[0u8; 16]);
+		b.extend_from_slice(&1u32.to_le_bytes());
+		b.extend_from_slice(&[0; 4]);
+		b.extend_from_slice(&original[64..88]);
+		b.extend_from_slice(&[0u8; 12]);
+		b.extend_from_slice(&1u32.to_le_bytes());
+		b.extend_from_slice(&[0, 0, 1, 0]);
+		b.extend_from_slice(&original[88..]);
+		b[16..20].copy_from_slice(&2u32.to_le_bytes());
+		b[20..24].copy_from_slice(&112u32.to_le_bytes());
+		b[24..28].copy_from_slice(&152u32.to_le_bytes());
+		b[32..36].copy_from_slice(&2u32.to_le_bytes());
+		b[148..150].copy_from_slice(&1u16.to_le_bytes());
+		let crc = crc32fast::hash(&b[64..]);
+		b[28..32].copy_from_slice(&crc.to_le_bytes());
+		let new = Snapshot {
+			version: "2".into(),
+			index: Arc::new(Index::parse(b.into()).unwrap()),
+		};
+		assert_eq!(new.index.lookup(path).unwrap(), Some(entry));
+		assert_eq!(reader.read(&new, path).await.unwrap().1, b"image bytes"[..]);
+		tokio::fs::remove_dir_all(root).await.unwrap();
+	}
+
+	fn golden() -> Bytes {
+		crate::test_index().into()
 	}
 
 	#[tokio::test]
@@ -390,7 +563,7 @@ mod tests {
 		store
 			.put(
 				&Path::from(format!("ui/sdo/{}", entry.object_path())),
-				Bytes::from_static(b"image bytes").into(),
+				Bytes::from_static(b"xximage bytesyy").into(),
 			)
 			.await
 			.unwrap();
@@ -435,7 +608,7 @@ mod tests {
 		assert!(!reader.reload().await.unwrap());
 
 		let mut replacement = golden().to_vec();
-		replacement[72..104].fill(2);
+		replacement[64..80].fill(2);
 		let checksum = crc32fast::hash(&replacement[64..]);
 		replacement[28..32].copy_from_slice(&checksum.to_le_bytes());
 		put(&store, "patches/1/assets.bin", replacement.into()).await;
@@ -455,12 +628,15 @@ mod tests {
 		}
 		assert!(!reader.reload().await.unwrap());
 		let path = "ui/icon/000000/000000.tex";
-		for (snapshot, content) in [(&old, b"old".as_slice()), (&updated, b"new".as_slice())] {
+		for (snapshot, content) in [
+			(&old, b"old content".as_slice()),
+			(&updated, b"new content".as_slice()),
+		] {
 			let entry = snapshot.index.lookup(path).unwrap().unwrap();
 			put(
 				&store,
 				&entry.object_path(),
-				Bytes::copy_from_slice(content),
+				Bytes::from([b"xx".as_slice(), content, b"yy".as_slice()].concat()),
 			)
 			.await;
 			assert_eq!(reader.read(snapshot, path).await.unwrap().1, content);
@@ -484,7 +660,7 @@ mod tests {
 				.fingerprint(),
 			updated.index.fingerprint()
 		);
-		assert_eq!(reader.read(&old, path).await.unwrap().1, b"old"[..]);
+		assert_eq!(reader.read(&old, path).await.unwrap().1, b"old content"[..]);
 	}
 
 	async fn put(store: &InMemory, path: &str, bytes: Bytes) {

@@ -26,11 +26,7 @@ mod tests {
 	#[tokio::test(start_paused = true)]
 	async fn refreshes_hourly_recovers_after_failure_and_stops_on_shutdown() {
 		let store = Arc::new(InMemory::new());
-		let hex = format!(
-			"4958415301004000000000002c00010001000000400000006c000000f9b87a16{}0ae203872dc9c845{}01000000",
-			"00".repeat(32),
-			"01".repeat(32)
-		);
+		let hex = include_str!("../../bm_asset_index/tests/fixtures/ixas-v2.hex").trim();
 		let index: Bytes = (0..hex.len())
 			.step_by(2)
 			.map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())

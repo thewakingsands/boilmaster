@@ -37,7 +37,7 @@ Set `BM_GAME_DIRECTORY` to a writable persistent directory (default `game`; Dock
 
 Public version keys are the release titles, for example `20260908-6d044b4`. The separate `version` field comes from the asset filename, for example `2026.09.01.0000.0000`. Releases with the same game version but different release titles are distinct versions. Only the newest local release is announced to search ingestion. Search indexing runs asynchronously after activation, so new-version searches may be temporarily unavailable while indexing completes. Search cursors from an older release must be restarted after an update.
 
-The `/admin` routes are temporarily disabled. Use `GET /api/version` to inspect local releases and update status.
+Use `GET /api/version` to inspect local releases and update status, or enable the optional `/admin` dashboard described below.
 
 ### Triggering an update
 
@@ -111,7 +111,31 @@ Documentation synchronization anonymously downloads `docs.zip` and
 `docs.zip.sha256` from the configured public repository's latest stable GitHub
 Release. Actions artifacts are not used because their download endpoint requires
 authentication. The documentation repository publishes these assets when `main`
-builds successfully; publishing does not automatically synchronize running servers.
+builds successfully. Publishing alone does not synchronize running servers; CI can
+trigger synchronization after both release assets have been uploaded:
+
+```sh
+curl --fail-with-body -X POST \
+  -H "Authorization: Bearer $BM_UPDATE_TOKEN" \
+  https://your-host/api/docs/update
+```
+
+`POST /api/docs/update` uses the same `BM_UPDATE_TOKEN` authentication as data
+updates, including the compatible `?token=...` query parameter. Prefer the header
+to avoid exposing secrets in proxy logs. An absent or empty server token rejects
+POST with `401 Unauthorized`. This endpoint works even when the admin dashboard
+is disabled; admin credentials and CSRF tokens are not required.
+
+The response is `202 Accepted` with the documentation sync status (not a completed
+deployment). Poll public `GET /api/docs/update` until the same `job_id` has
+`running: false`. A non-null `error` means failure; otherwise `changed: true` means
+a release was installed, and `changed: false` means the site was already current.
+`checked_at` is the completion time in Unix seconds; `current` describes the active
+release. Concurrent CI and admin triggers join the same job. If `job_id` changes
+or becomes null after a server restart, the original job can no longer be tracked;
+CI should retry or report an indeterminate result rather than assume success.
+These responses use `Cache-Control: no-store`. `GET /api/docs` remains the API
+reference page. No client-supplied download URL or release selection is accepted.
 
 For server-side sync, mount a **writable, persistent** directory at `/app/static`
 (or `BM_HTTP_DIRECTORY`). The existing static files continue to work before the

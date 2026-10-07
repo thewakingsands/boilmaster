@@ -4,14 +4,14 @@ use aide::{
 };
 use axum::{
 	Json,
-	extract::{Query, State},
-	http::{HeaderMap, StatusCode},
+	extract::State,
+	http::StatusCode,
 	response::{IntoResponse, Response},
 	routing::post,
 };
 use bm_data::{LocalVersion, UpdateStatus};
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use super::api::ApiState;
 use crate::service::Service;
@@ -22,7 +22,11 @@ pub fn router(state: ApiState) -> ApiRouter {
 			"/",
 			get_with(versions, versions_docs).with_state(state.clone()),
 		)
-		.route("/", post(update).with_state(state))
+		.route(
+			"/",
+			super::update_auth::protect(post(update), std::env::var("BM_UPDATE_TOKEN").ok())
+				.with_state(state),
+		)
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -71,57 +75,7 @@ async fn versions(State(Service { data, .. }): State<Service>) -> Json<VersionsR
 	Json(payload(&data, data.update_status()))
 }
 
-#[derive(Deserialize)]
-struct UpdateQuery {
-	token: Option<String>,
-}
-
-fn authorized(expected: Option<&str>, supplied: Option<&str>) -> bool {
-	match (expected.filter(|s| !s.is_empty()), supplied) {
-		(Some(expected), Some(supplied)) => {
-			// Compare all bytes without early exit on the first differing byte.
-			let mut difference = expected.len() ^ supplied.len();
-			for (i, byte) in expected.bytes().enumerate() {
-				difference |= usize::from(byte ^ supplied.as_bytes().get(i).copied().unwrap_or(0));
-			}
-			difference == 0
-		}
-		_ => false,
-	}
-}
-
-async fn update(
-	State(Service { data, .. }): State<Service>,
-	Query(query): Query<UpdateQuery>,
-	headers: HeaderMap,
-) -> Response {
-	let expected = std::env::var("BM_UPDATE_TOKEN").ok();
-	let bearer = headers
-		.get("authorization")
-		.and_then(|v| v.to_str().ok())
-		.and_then(|v| v.strip_prefix("Bearer "));
-	if !authorized(expected.as_deref(), bearer.or(query.token.as_deref())) {
-		return (
-			StatusCode::UNAUTHORIZED,
-			Json(serde_json::json!({"error": "unauthorized"})),
-		)
-			.into_response();
-	}
+async fn update(State(Service { data, .. }): State<Service>) -> Response {
 	let status = data.trigger_update();
 	(StatusCode::ACCEPTED, Json(payload(&data, status))).into_response()
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-
-	#[test]
-	fn update_requires_nonempty_matching_token() {
-		assert!(!authorized(None, None));
-		assert!(!authorized(Some(""), Some("")));
-		assert!(!authorized(Some("secret"), None));
-		assert!(!authorized(Some("secret"), Some("secreT")));
-		assert!(!authorized(Some("secret"), Some("secret-extra")));
-		assert!(authorized(Some("secret"), Some("secret")));
-	}
 }

@@ -46,6 +46,7 @@ pub struct ReleaseInfo {
 
 #[derive(Clone, Default, Serialize)]
 pub struct Status {
+	pub job_id: Option<String>,
 	pub running: bool,
 	pub checked_at: Option<u64>,
 	pub changed: Option<bool>,
@@ -123,7 +124,10 @@ impl Docs {
 	pub fn trigger(self: &Arc<Self>) -> Status {
 		let mut status = self.status.lock().expect("docs status");
 		if !status.running {
+			status.job_id = Some(uuid::Uuid::new_v4().to_string());
 			status.running = true;
+			status.checked_at = None;
+			status.changed = None;
 			status.error = None;
 			let docs = self.clone();
 			tokio::spawn(async move {
@@ -529,6 +533,93 @@ mod tests {
 		)
 		.unwrap();
 		assert!(Docs::new(directory.path().into(), Config::default()).is_err());
+	}
+
+	#[tokio::test]
+	async fn ci_update_api_authenticates_and_shares_admin_job() {
+		let directory = tempfile::tempdir().unwrap();
+		let docs = Docs::new(directory.path().into(), Config::default()).unwrap();
+		docs.install(site("current"), "release-one", "", "abc".into())
+			.unwrap();
+		let app = crate::api1::docs::router(docs.clone(), Some("secret".into()));
+		let request = |method: &str, uri: &str| {
+			Request::builder()
+				.method(method)
+				.uri(uri)
+				.body(Body::empty())
+				.unwrap()
+		};
+		let response = app
+			.clone()
+			.oneshot(request("POST", "/docs/update"))
+			.await
+			.unwrap();
+		assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+		assert_eq!(response.headers()["cache-control"], "no-store");
+		assert!(docs.status().job_id.is_none());
+		assert!(!docs.status().running);
+		// Model a job started through the dashboard, without accessing GitHub.
+		{
+			let mut status = docs.status.lock().unwrap();
+			status.running = true;
+			status.job_id = Some("admin-job".into());
+		}
+		for method in ["GET", "POST", "POST"] {
+			let uri = if method == "GET" {
+				"/docs/update"
+			} else {
+				"/docs/update?token=secret"
+			};
+			let response = app.clone().oneshot(request(method, uri)).await.unwrap();
+			assert_eq!(
+				response.status(),
+				if method == "GET" {
+					StatusCode::OK
+				} else {
+					StatusCode::ACCEPTED
+				}
+			);
+			assert_eq!(response.headers()["cache-control"], "no-store");
+			let body: serde_json::Value =
+				serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap())
+					.unwrap();
+			assert_eq!(body["running"], true);
+			assert_eq!(body["job_id"], "admin-job");
+			assert_eq!(body["current"]["tag"], "release-one");
+		}
+		{
+			let mut status = docs.status.lock().unwrap();
+			status.running = false;
+			status.checked_at = Some(123);
+			status.error = Some("download failed".into());
+		}
+		let response = app.oneshot(request("GET", "/docs/update")).await.unwrap();
+		let body: serde_json::Value =
+			serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
+		assert_eq!(body["running"], false);
+		assert_eq!(body["error"], "download failed");
+		assert_eq!(body["current"]["tag"], "release-one");
+	}
+
+	#[tokio::test]
+	async fn new_job_clears_previous_result_and_gets_an_identifier() {
+		let directory = tempfile::tempdir().unwrap();
+		let docs = Docs::new(directory.path().into(), Config::default()).unwrap();
+		{
+			let mut status = docs.status.lock().unwrap();
+			status.job_id = Some("previous".into());
+			status.checked_at = Some(123);
+			status.changed = Some(true);
+			status.error = Some("old error".into());
+		}
+		// No await: the current-thread runtime drops the spawned worker before any network I/O.
+		let status = docs.trigger();
+		assert!(status.running);
+		assert!(uuid::Uuid::parse_str(status.job_id.as_deref().unwrap()).is_ok());
+		assert!(status.checked_at.is_none());
+		assert!(status.changed.is_none());
+		assert!(status.error.is_none());
+		assert_eq!(docs.trigger().job_id, status.job_id);
 	}
 
 	#[tokio::test]

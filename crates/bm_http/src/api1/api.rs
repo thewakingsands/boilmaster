@@ -34,7 +34,7 @@ pub struct ApiState {
 	pub reader_state: RowReaderState,
 }
 
-pub fn router(config: Config, state: HttpState) -> Router {
+pub fn router(config: Config, state: HttpState, docs: Arc<crate::admin::docs::Docs>) -> Router {
 	let mut openapi = openapi::OpenApi::default();
 
 	let state = ApiState {
@@ -71,6 +71,10 @@ pub fn router(config: Config, state: HttpState) -> Router {
 				openapi: Arc::new(openapi),
 			}),
 		)
+		.merge(super::docs::router(
+			docs,
+			std::env::var("BM_UPDATE_TOKEN").ok(),
+		))
 		.layer(CorsLayer::permissive())
 		.route("/docs", get(scalar))
 }
@@ -161,5 +165,67 @@ async fn scalar(uri: Uri) -> impl IntoResponse {
 				script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference" {}
 			}
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use axum::{
+		body::{Body, to_bytes},
+		http::{Request, StatusCode},
+	};
+	use tower::ServiceExt;
+
+	#[tokio::test]
+	async fn documentation_update_keeps_scalar_and_public_status_available() {
+		let directory = tempfile::tempdir().unwrap();
+		let docs =
+			crate::admin::docs::Docs::new(directory.path().into(), Default::default()).unwrap();
+		let app = Router::new().nest(
+			"/api",
+			super::super::docs::router(docs.clone(), None).route("/docs", get(scalar)),
+		);
+		for (path, expected_content_type) in [
+			("/api/docs", "text/html"),
+			("/api/docs/update", "application/json"),
+		] {
+			let response = app
+				.clone()
+				.oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+				.await
+				.unwrap();
+			assert_eq!(response.status(), StatusCode::OK);
+			assert!(
+				response.headers()["content-type"]
+					.to_str()
+					.unwrap()
+					.starts_with(expected_content_type)
+			);
+			let body = to_bytes(response.into_body(), 8192).await.unwrap();
+			if path == "/api/docs" {
+				assert!(
+					std::str::from_utf8(&body)
+						.unwrap()
+						.contains("api-reference")
+				);
+			} else {
+				let status: serde_json::Value = serde_json::from_slice(&body).unwrap();
+				assert_eq!(status["running"], false);
+				assert!(status["job_id"].is_null());
+			}
+		}
+		let response = app
+			.oneshot(
+				Request::builder()
+					.method("POST")
+					.uri("/api/docs/update?token=anything")
+					.body(Body::empty())
+					.unwrap(),
+			)
+			.await
+			.unwrap();
+		assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+		assert!(!docs.status().running);
 	}
 }

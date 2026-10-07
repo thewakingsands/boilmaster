@@ -1,5 +1,6 @@
 mod api;
 mod asset;
+pub(crate) mod docs;
 mod error;
 mod extract;
 mod filter;
@@ -9,6 +10,7 @@ mod read;
 mod search;
 mod sheet;
 mod string;
+mod update_auth;
 mod value;
 mod version;
 

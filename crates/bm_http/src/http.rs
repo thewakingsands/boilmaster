@@ -74,7 +74,10 @@ pub async fn serve(
 		)
 		.nest("/admin", admin)
 		.nest("/i", legacy_assets)
-		.nest("/api", api1::router(config.api1, state.clone()))
+		.nest(
+			"/api",
+			api1::router(config.api1, state.clone(), docs.clone()),
+		)
 		.nest("/health", health::router(state))
 		.fallback(axum::routing::get(admin::docs::serve).with_state(docs))
 		.layer(
